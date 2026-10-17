@@ -40,7 +40,6 @@ ELEC = 0.4747                     # kgCO2/kWh, 소비단
 EF_TAXI = 1513.8104 * SPEED_KMH ** -0.6075       # g/대·km
 EF_CAR = 1256.0382 * SPEED_KMH ** -0.5914
 COST_DAY = 560_428                # 원/대·일, 수원시 2024 표준운송원가(안)
-GWANGGYO_PROD = 329_501 / 10 / 365               # 90.3 통행/대·일
 
 T0, T1 = 8 * 60 + 30, 17 * 60     # 운행 08:30–17:00 (분)
 CARE = 90                         # 진료 소요 (분)
@@ -122,18 +121,16 @@ class Road:
 # ── 시뮬레이션 ────────────────────────────────────────────────────────
 @dataclass
 class Ride:
+    """한 번의 배차. 경로 모양은 담지 않는다 — 지도는 stop_routes 가 그린다."""
+
     v: int            # 차량 번호
     n: int            # 탑승 인원
     call: float       # 호출 시각 (분)
-    depart: float     # 공차 출발
     pick: float       # 승차
     drop: float       # 하차
     km_rev: float     # 수송거리
     km_dead: float    # 공차거리
-    path: np.ndarray  # 수송 구간 도로 모양 (EPSG:5179)
-    path_dead: np.ndarray  # 공차 구간(직전 하차지→승차지) 도로 모양
-    back: int         # 0 집→의원 · 1 의원→집
-    stop: int         # 지정 승차장 번호 (문앞 호출이면 -1)
+    stop: int         # 지정 승차장 번호
     dest: int         # 의료기관 번호
 
 
@@ -193,13 +190,13 @@ def simulate(road: Road, meta: dict, veh: dict, fleet: int,
         legs.append({"t": t_call[i], "a": int(o_node[i]), "b": int(d_node[i]),
                      "ka": ks, "kb": kd,
                      "ax": px[i], "ay": py[i],
-                     "bx": dest[di[i], 0], "by": dest[di[i], 1], "back": 0,
+                     "bx": dest[di[i], 0], "by": dest[di[i], 1],
                      "stop": int(stop_of[i]), "dest": int(di[i])})
         legs.append({"t": t_call[i] + CARE, "a": int(d_node[i]),
                      "b": int(o_node[i]),
                      "ka": kd, "kb": ks,
                      "ax": dest[di[i], 0], "ay": dest[di[i], 1],
-                     "bx": px[i], "by": py[i], "back": 1,
+                     "bx": px[i], "by": py[i],
                      "stop": int(stop_of[i]), "dest": int(di[i])})
     legs.sort(key=lambda r: r["t"])
 
@@ -256,19 +253,14 @@ def simulate(road: Road, meta: dict, veh: dict, fleet: int,
                 best, best_t, best_d, best_k = v, arr, dk, kk
         v, km_dead, pick = best, best_d, best_t
         src += int(best_k)
-        # 공차 구간도 도로로 그린다 — 안 그리면 배차 이동 중 차가 멈춰 보인다
-        pd_ = (road.path_xy(pred[row[at[v][0]]], at[v][0], a)
-               if at[v] is not None and at[v][0] in row else np.empty((0, 2)))
         km_rev, kk = km_of(g["ka"], g["kb"], a, b,
                            (g["bx"] - g["ax"], g["by"] - g["ay"]))
         src += int(kk)
-        depart = max(g["t"], free[v])
         drop = pick + km_rev / SPEED_KMH * 60
         free[v] = drop + BOARD
         at[v] = (b, g["kb"])
-        rides.append(Ride(v, len(grp), g["t"], depart, pick, drop,
-                          km_rev, km_dead, road.path_xy(pred[row[a]], a, b),
-                          pd_, g["back"], g["stop"], g["dest"]))
+        rides.append(Ride(v, len(grp), g["t"], pick, drop,
+                          km_rev, km_dead, g["stop"], g["dest"]))
 
     pax = sum(r.n for r in rides)
     km_rev = sum(r.km_rev for r in rides)
@@ -480,52 +472,3 @@ def reach(tab: dict, budget: float, wait: float) -> dict:
             np.where(cnt > 0, budget - wait - walk, np.nan)[cnt > 0],
             weights=pop[cnt > 0])) if (cnt > 0).any() else 0.0,
     }
-
-
-# ── 의원 실시간 현황 (가상) ───────────────────────────────────────────
-def clinic_status(meta: dict, idx: list[int], clock: float,
-                  seed: int = 20261016) -> list[dict]:
-    """의원별 현재 진료 의사 수와 대기 환자 — **가상 자료**.
-
-    건강보험심사평가원은 기관별 인력 현황을 공개하지만 **실시간 진료 인원이나
-    대기 환자를 주는 공개 API 는 없다.** 아래 값은 그런 API 가 있다고 치고
-    만든 것이며 실제가 아니다. 뒷날 연동한다면 이 함수만 갈아끼우면 된다.
-
-    그럴듯하게 두려고 세 가지를 지킨다.
-      · 점심(12:30~14:00)과 18시 이후에는 진료 인원이 줄거나 0 이 된다
-      · 대기 환자는 오전 9~11시와 오후 2~4시에 몰린다
-      · 같은 의원·같은 분이면 언제나 같은 값이 나온다(시드 고정)
-    """
-    out = []
-    for j in idx:
-        d = meta["dest"][j]
-        staff = max(1, int(d[7]))
-        rnd = np.random.default_rng(seed + j * 7919)
-        h = clock / 60
-        if h < 9 or h >= 18:
-            open_ratio = 0.0
-        elif 12.5 <= h < 14:
-            open_ratio = 0.35
-        elif h >= 17:
-            open_ratio = 0.6
-        else:
-            open_ratio = 1.0
-        on = int(round(staff * open_ratio * (0.75 + 0.5 * rnd.random())))
-        on = min(staff, max(0 if open_ratio == 0 else 1, on))
-        # 혼잡도 — 오전·오후 봉우리 두 개
-        peak = (np.exp(-((h - 10.0) / 1.5) ** 2)
-                + 0.8 * np.exp(-((h - 15.0) / 1.6) ** 2))
-        waiting = 0 if on == 0 else int(round(
-            on * 4.5 * peak * (0.6 + 0.8 * rnd.random())))
-        wait_min = 0 if on == 0 else int(round(waiting / on * 6.5))
-        out.append({"dest": j, "name": d[5], "kind": d[6],
-                    "staff": staff, "on": on, "waiting": waiting,
-                    "wait_min": wait_min, "internal": d[2],
-                    "open": on > 0})
-    return out
-
-
-def now_minutes(now) -> float:
-    """실제 시각을 운행 시각(분)으로. 운행시간 밖이면 끝 시각에 붙인다."""
-    m = now.hour * 60 + now.minute + now.second / 60
-    return min(max(m, T0), T1 + 180)
