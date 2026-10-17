@@ -48,10 +48,11 @@ def road() -> sim.Road:
     return sim.Road()
 
 
-@st.cache_data(show_spinner="경로를 그리는 중", max_entries=16)
-def routes(k: int) -> list[dict]:
-    R = sim.stop_routes(road(), sim.designated_stops(road(), base(), k),
-                        base(), 2)
+@st.cache_data(show_spinner="경로를 그리는 중", max_entries=32)
+def routes(sel: str, k: int) -> list[dict]:
+    """승차장은 scenarios.json 이 유일한 출처다. 화면에서 다시 풀지 않는다.
+    다시 풀면 시드·알고리즘이 바뀔 때 표와 지도가 조용히 어긋난다."""
+    R = sim.stop_routes(road(), D["stops"][sel][str(k)], base(), 2)
     out = []
     for r in R:
         xy = np.asarray(r.pop("path"), float)
@@ -111,6 +112,18 @@ st.markdown(
     "border-radius:3px;padding:3px 8px;font-weight:600'>수요·운행은 추정치"
     "</span></div>", unsafe_allow_html=True)
 
+c0 = st.columns([1.5, 4.5])
+SEL = c0[0].radio("승차장 선정", ["mclp", "kmeans"], horizontal=True,
+                  format_func=lambda s: {"mclp": "MCLP",
+                                         "kmeans": "k-평균"}[s],
+                  help="MCLP = 기준 거리 안 고령인구를 최대화하는 입지 모형"
+                       "(Church & ReVelle 1974). k-평균은 예전 방식으로 "
+                       "비교 기준선이다. 둘 다 같은 보행망 자로 잰다.")
+c0[1].caption(
+    f"**{'MCLP — 기준 거리 안 고령인구 최대화' if SEL == 'mclp' else 'k-평균 — 비교 기준선'}**"
+    f" · 기준 거리 {D['meta'].get('S_m', 600):,.0f} m"
+    f" · 후보 실재 정류장 + 도로망 노드"
+    f" · 보행 {D['meta'].get('보행', 'OSM 보행망')}")
 c = st.columns([1.9, 1.3, 1.3, 1.3, 1.5])
 vi = c[0].selectbox("차종", range(len(VEH)),
                     format_func=lambda i: VEH[i]["name"], index=1)
@@ -123,8 +136,9 @@ bl = c[4].selectbox("현행(탄소 비교 기준)", list(BASELINE), index=0,
                          "이 통행은 지금 택시나 자가용으로 이뤄지고 있다.")
 BL_NOTE, BL_EF, BL_OCC = BASELINE[bl]
 
+ROWS = ROWS[ROWS.sel == SEL]
 cur = ROWS[(ROWS.vi == vi) & (ROWS.fleet == fleet) & (ROWS.k == K)].iloc[0]
-TAB = D["reach"][str(K)]
+TAB = D["reach"][SEL][str(K)]
 R0 = sim.reach(TAB, BUD, float(cur.wait))
 
 
@@ -135,7 +149,7 @@ def carbon_of(df: pd.DataFrame) -> pd.Series:
 def reach_of(k: int, fleet_: int, budget: int) -> dict:
     w = float(ROWS[(ROWS.k == k) & (ROWS.fleet == fleet_)
                    & (ROWS.vi == 0)].iloc[0].wait)
-    return sim.reach(D["reach"][str(k)], budget, w)
+    return sim.reach(D["reach"][SEL][str(k)], budget, w)
 
 
 # ── 핵심 수치 ─────────────────────────────────────────────────────────
@@ -189,11 +203,18 @@ st.markdown(f"""
 </div>""", unsafe_allow_html=True)
 
 cut = float(carbon_of(pd.DataFrame([cur])).iloc[0])
-k = st.columns(4)
+SM = D["meta"].get("S_m", 600)
+k = st.columns(5)
 k[0].metric("평균 대기", f"{cur.wait:,.0f}분",
             f"10번 중 1번은 {cur.wait_p90:,.0f}분 이상", delta_color="off")
 k[1].metric("집→승차장 보행", f"{R0['walk_min']:.1f}분",
-            f"중앙 {cur.walk_med:,.0f} m · 0.8 m/s", delta_color="off")
+            f"중앙 {cur.walk_med:,.0f} m · "
+            + ("실제 보행망" if SEL == "mclp" else "직선 추정"),
+            delta_color="off")
+k[4].metric(f"도보 {SM / 60 / 0.8:.0f}분 커버",
+            f"{100 * cur.cover_share:.1f}%",
+            f"승차장 {SM:,.0f} m 안 고령인구 — MCLP 가 최대화하는 값",
+            delta_color="off")
 k[2].metric("연간 탄소", ("± 0.0 t" if abs(cut) < .05 else
                        f"{'▲ +' if cut >= 0 else '▼ −'}{abs(cut):,.1f} t"),
             f"현행 {bl} 대비", delta_color="off" if abs(cut) < .05
@@ -223,10 +244,10 @@ GKEY = {(g[0], g[1]): i for i, g in enumerate(GRID)}
 
 
 @st.cache_data(show_spinner=False)
-def grid_cells(k_: int) -> list[int]:
+def grid_cells(k_: int, sel: str = "") -> list[int]:
     """출발점마다 속한 500m 격자 번호. 격자망이 500m 로 떨어져 있다."""
     out = []
-    for x, y in D["reach"][str(k_)]["cell_xy"]:
+    for x, y in D["reach"][SEL][str(k_)]["cell_xy"]:
         gx = GX0 + ((x - GX0) // 500) * 500
         gy = GY0 + ((y - GY0) // 500) * 500
         out.append(GKEY.get((gx, gy), -1))
@@ -235,7 +256,7 @@ def grid_cells(k_: int) -> list[int]:
 
 def grid_status() -> pd.DataFrame:
     """격자별 전후 도달 — 지도 색을 정한다."""
-    gi = np.asarray(grid_cells(K))
+    gi = np.asarray(grid_cells(K, SEL))
     pop = np.asarray(TAB["cell_pop"], float)
     now = np.asarray(R0["per_cell_now"], float) > 0
     new = np.asarray(R0["per_cell"]) > 0
@@ -255,8 +276,8 @@ def grid_status() -> pd.DataFrame:
 GS = grid_status()
 COLORS = {"원래 닿던 곳": C4, "새로 닿게 됨": GOOD, "일부만": "#8aa8b0",
           "그래도 못 닿음": BAD}
-STOPS = D["stops"][str(K)]
-RT = routes(K)
+STOPS = D["stops"][SEL][str(K)]
+RT = routes(SEL, K)
 
 
 def payload_kakao() -> dict:
@@ -369,6 +390,8 @@ def c_fleet():
 def c_stops():
     d = pd.DataFrame([{
         "승차장 수": kk, "도달 (%)": 100 * reach_of(kk, fleet, BUD)["new_share"],
+        "커버 (%)": 100 * float(ROWS[(ROWS.k == kk) & (ROWS.fleet == fleet)
+                                   & (ROWS.vi == 0)].iloc[0].cover_share),
         "보행 중앙 (m)": int(ROWS[(ROWS.k == kk) & (ROWS.fleet == fleet)
                                & (ROWS.vi == 0)].iloc[0].walk_med),
     } for kk in D["meta"]["k"]])
@@ -387,12 +410,16 @@ def c_stops():
         y=alt.Y("보행 중앙 (m):Q", axis=alt.Axis(titleColor=C2,
                                              labelFontSize=13,
                                              titleFontSize=13)))
+    lc = alt.Chart(d).mark_line(color=C3, point={"size": 70},
+                                strokeWidth=2.2, opacity=.85).encode(
+        x="승차장 수:Q", y=alt.Y("커버 (%):Q"))
     pk = alt.Chart(pd.DataFrame({"x": [K]})).mark_rule(
         color="#555", strokeDash=[3, 3], strokeWidth=1.6).encode(x="x:Q")
-    return alt.layer(la, lb, pk).resolve_scale(y="independent"), (
-        "승차장을 늘리면 집에서 승차장까지 덜 걸어 도달이 는다. 다만 차가 더"
-        " 많이 돌아 탄소는 조금 나빠지고, 정류장 설치 비용도 는다. 점선이"
-        " 보행 중앙값(오른쪽 축)이다.")
+    return alt.layer(la, lc, lb, pk).resolve_scale(y="independent"), (
+        f"청록 실선이 30분 도달, 보라 실선이 도보 {SM:,.0f} m 커버(MCLP 가"
+        f" 최대화하는 값), 주황 점선이 보행 중앙값(오른쪽 축)이다. 승차장을"
+        f" 늘리면 덜 걸어 도달이 늘지만, 차가 더 많이 돌아 탄소는 조금"
+        f" 나빠지고 설치 비용도 는다.")
 
 
 def c_split():
@@ -428,8 +455,12 @@ def c_stoppop():
     d = pd.DataFrame([{
         "승차장": s["name"].split()[-1], "고령인구": s["pop"],
         "보행 중앙 (m)": s["walk_med"], "보행 최대 (m)": s["walk_max"],
-        "맡은 격자": s["cells"]} for s in STOPS])
-    bar = alt.Chart(d).mark_bar(color=C1, cornerRadius=3).encode(
+        "맡은 격자": s["cells"],
+        "구분": "기존 정류장" if s.get("exist") else "신설"} for s in STOPS])
+    bar = alt.Chart(d).mark_bar(cornerRadius=3).encode(
+        color=alt.Color("구분:N", scale=alt.Scale(
+            domain=["기존 정류장", "신설"], range=[C3, C1]),
+            legend=alt.Legend(orient="top", title=None, labelFontSize=12)),
         x=alt.X("승차장:N", sort=None, title="지정 승차장 (인구 순위)",
                 axis=alt.Axis(labelFontSize=13, titleFontSize=13)),
         y=alt.Y("고령인구:Q", title="맡은 고령인구 (명)",
@@ -597,9 +628,31 @@ with st.expander("방법과 한계", expanded=False):
 국가계수에 소형승합이 없어 쏠라티 디젤은 승용 대형 경유~화물 소형 경유로
 범위를 잡았다.
 
-**지정 승차장은 임시 가정이다** — 고령인구를 가중치로 둔 군집 중심을 도로에
-붙인 것이다. 실제 선정에는 보행 접근권·정차 가능 지점·소유관계 분석이 따로
-필요하다. 목록이 나오면 `sim.designated_stops()` 만 갈아끼우면 된다.
+**승차장을 어떻게 골랐나** — MCLP(최대 커버 입지, Church & ReVelle 1974).
+승차장 k곳으로 **기준 거리 {SM:,.0f} m(0.8 m/s 로 {SM / 48:.1f}분) 안에 든
+고령인구를 최대화**한다.
+
+```
+max Σ aᵢyᵢ   s.t.  Σ_{{j∈Nᵢ}} xⱼ ≥ yᵢ ,  Σxⱼ = k ,  x,y ∈ {{0,1}}
+aᵢ = 수요점 i 고령인구,  Nᵢ = {{ j : 보행거리(i,j) ≤ S }}
+```
+
+후보지는 **실재 버스정류장 417곳 + 도로망 노드를 100 m 격자로 솎은 것**이다.
+평면 아무 데나가 아니라 **실제로 세울 수 있는 자리**에서만 고른다. 보행거리는
+OSM 보행망 최단경로이고, 이 지역에서 **직선의 1.34배**(상위 10%는 1.80배)다 —
+논·하천·자유로가 가로막기 때문이다. 같은 값을 내는 해가 여럿일 때는 실재
+정류장과 짧은 보행을 선호하도록 아주 작은 가중치를 둬서 해를 결정한다. 그래서
+승차장 수를 바꿔도 지도가 임의로 뒤집히지 않는다.
+
+**커버 밖 사람도 걸어서 탄다.** MCLP 는 어디에 놓을지만 정하고, 30분 도달은
+커버 여부와 무관하게 실제 보행시간으로 따로 센다.
+
+**비교 기준선** — 위 「승차장 선정」에서 k-평균을 고르면 예전 방식이 나온다.
+두 방식 모두 같은 보행망 자로 재므로 공정하게 견줄 수 있다.
+
+**그래도 임시 가정이다** — 실제 선정에는 정차 가능 지점, 보도·횡단 여건,
+소유관계 확인이 따로 필요하다. 설계속도가 높은 도로변 후보는 정차 가능성을
+별도로 확인해야 한다.
 """)
 
 st.caption(

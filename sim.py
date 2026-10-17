@@ -36,6 +36,7 @@ DATA = Path(__file__).resolve().parent / "data"
 
 # ── 상수 ──────────────────────────────────────────────────────────────
 SPEED_KMH = 30.0                  # 평균 운행속도
+WALK_SPEED = 0.8                  # m/s, 고령 보행
 ELEC = 0.4747                     # kgCO2/kWh, 소비단
 EF_TAXI = 1513.8104 * SPEED_KMH ** -0.6075       # g/대·km
 EF_CAR = 1256.0382 * SPEED_KMH ** -0.5914
@@ -136,11 +137,16 @@ class Ride:
 
 def simulate(road: Road, meta: dict, veh: dict, fleet: int,
              seed: int = 20261016, stops: list[dict] | None = None,
-             km_table: dict | None = None) -> dict:
+             km_table: dict | None = None,
+             walk_tab: tuple[np.ndarray, np.ndarray] | None = None) -> dict:
     """지정 승차장에서 태워 의원까지 나른다.
 
     똑버스는 지정 승차장 운영이다. 고령자가 승차장까지 걷는 거리도 함께
     돌려준다 — 승차장을 줄이면 탄소는 좋아지고 보행은 나빠진다.
+
+    walk_tab 을 주면 (격자별 배정 승차장, 보행거리 m) 를 거기서 읽는다.
+    실제 보행망 최단경로다. 안 주면 직선거리로 물러선다 — 이 지역에서 둘의
+    비는 중앙 1.34 라, 직선은 보행을 3분의 1쯤 짧게 본다.
 
     km_table 을 주면 주행거리를 거기서 읽는다. 열쇠는 ("S", 승차장번호) 와
     ("D", 의료기관번호) 의 쌍이다. 카카오 길찾기로 받아 둔 값을 넣는 자리이고,
@@ -173,12 +179,17 @@ def simulate(road: Road, meta: dict, veh: dict, fleet: int,
         raise ValueError("똑버스는 지정 승차장 운영이다 — stops 가 필요하다")
     sx = np.array([s["x"] for s in stops])
     sy = np.array([s["y"] for s in stops])
-    walk = np.zeros(n_trip)
-    stop_of = np.zeros(n_trip, int)
-    for i in range(n_trip):
-        d = np.hypot(sx - ox[oi[i]], sy - oy[oi[i]])
-        stop_of[i] = int(np.argmin(d))
-        walk[i] = float(d[stop_of[i]])
+    if walk_tab is not None:
+        sc, wc = walk_tab                      # 격자 단위로 미리 구한 보행망 값
+        stop_of = np.asarray(sc, int)[oi]
+        walk = np.asarray(wc, float)[oi]
+    else:
+        walk = np.zeros(n_trip)
+        stop_of = np.zeros(n_trip, int)
+        for i in range(n_trip):
+            d = np.hypot(sx - ox[oi[i]], sy - oy[oi[i]])
+            stop_of[i] = int(np.argmin(d))
+            walk[i] = float(d[stop_of[i]])
     px, py = sx[stop_of], sy[stop_of]
     o_node = np.array([stops[j]["node"] for j in stop_of])
     d_node = road.snap(dest[di])
@@ -279,7 +290,7 @@ def simulate(road: Road, meta: dict, veh: dict, fleet: int,
             "walk_mean": float(ww.mean()),
             "walk_max": float(ww.max()),
             "walk_p90": float(np.percentile(ww, 90)),
-            "walk_min_med": float(np.median(ww)) / 0.8 / 60}
+            "walk_min_med": float(np.median(ww)) / WALK_SPEED / 60}
 
 
 # ── 탄소 ──────────────────────────────────────────────────────────────
@@ -388,7 +399,8 @@ def stop_routes(road: Road, stops: list[dict], meta: dict,
 # ── 도달 ──────────────────────────────────────────────────────────────
 def reach_tables(road: Road, meta: dict, stops: list[dict],
                  km_table: dict | None = None,
-                 max_min: int = 90) -> dict:
+                 max_min: int = 90,
+                 walk_tab: tuple[np.ndarray, np.ndarray] | None = None) -> dict:
     """도달 계산에 필요한 것만 추려 둔다.
 
     도입 후 한 사람의 문앞-의원 시간은
@@ -411,11 +423,16 @@ def reach_tables(road: Road, meta: dict, stops: list[dict],
     pop = np.array([c[3] for c in cells], float)
     now = np.array([c[2] for c in cells], float)
 
-    sx = np.array([s["x"] for s in stops])
-    sy = np.array([s["y"] for s in stops])
-    d = np.hypot(P[:, None, 0] - sx[None], P[:, None, 1] - sy[None])
-    cs = d.argmin(1)
-    walk = d[np.arange(len(P)), cs] / 0.8 / 60          # 분
+    if walk_tab is not None:
+        cs = np.asarray(walk_tab[0], int)
+        walk_m = np.asarray(walk_tab[1], float)
+    else:
+        sx = np.array([s["x"] for s in stops])
+        sy = np.array([s["y"] for s in stops])
+        d = np.hypot(P[:, None, 0] - sx[None], P[:, None, 1] - sy[None])
+        cs = d.argmin(1)
+        walk_m = d[np.arange(len(P)), cs]
+    walk = walk_m / WALK_SPEED / 60                     # 분
 
     dest = np.array([[x[0], x[1]] for x in meta["dest"]], float)
     dn = road.snap(dest)
@@ -433,7 +450,9 @@ def reach_tables(road: Road, meta: dict, stops: list[dict],
         hist[s["i"]] = np.bincount(
             np.clip(np.ceil(t).astype(int), 0, max_min),
             minlength=max_min + 1).cumsum()
-    return {"cell_stop": cs.tolist(), "cell_walk": np.round(walk, 2).tolist(),
+    return {"cell_stop": [int(v) for v in cs],
+            "cell_walk": np.round(walk, 2).tolist(),
+            "cell_walk_m": np.round(walk_m, 0).tolist(),
             "cell_pop": pop.tolist(), "cell_now": now.tolist(),
             "cell_xy": [[int(c[0]), int(c[1])] for c in cells],
             "hist": hist.tolist(), "max_min": max_min}
