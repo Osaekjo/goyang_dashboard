@@ -12,6 +12,7 @@
 """
 from __future__ import annotations
 
+import time
 from datetime import datetime, timedelta, timezone
 
 import altair as alt
@@ -42,10 +43,43 @@ def get_meta() -> dict:
     return sim.load_meta()
 
 
-def ll(xy) -> list[list[float]]:
+def rdp(xy: np.ndarray, tol: float = 8.0) -> np.ndarray:
+    """경로 꼭짓점 솎기(Ramer–Douglas–Peucker). 재생은 0.35초마다 지도를 통째로
+    다시 보내므로, 눈에 안 보이는 꼭짓점을 줄여야 전송량이 감당된다.
+    tol 은 미터 — 8 m 면 화면에서 차이가 나지 않는다."""
+    n = len(xy)
+    if n < 3:
+        return xy
+    keep = np.zeros(n, bool)
+    keep[0] = keep[-1] = True
+    stack = [(0, n - 1)]
+    while stack:
+        i, j = stack.pop()
+        if j <= i + 1:
+            continue
+        a, b = xy[i], xy[j]
+        ab = b - a
+        L = np.hypot(*ab)
+        seg = xy[i + 1:j]
+        if L < 1e-9:
+            d = np.hypot(seg[:, 0] - a[0], seg[:, 1] - a[1])
+        else:
+            d = np.abs(ab[0] * (a[1] - seg[:, 1])
+                       - ab[1] * (a[0] - seg[:, 0])) / L
+        k = int(np.argmax(d))
+        if d[k] > tol:
+            m = i + 1 + k
+            keep[m] = True
+            stack += [(i, m), (m, j)]
+    return xy[keep]
+
+
+def ll(xy, tol: float = 8.0) -> list[list[float]]:
     xy = np.asarray(xy, float)
     if len(xy) == 0:
         return []
+    if tol and len(xy) > 2:
+        xy = rdp(xy, tol)
     lon, lat = TO_WGS.transform(xy[:, 0], xy[:, 1])
     return [[round(a, 6), round(b, 6)] for a, b in zip(lon, lat)]
 
@@ -53,6 +87,10 @@ def ll(xy) -> list[list[float]]:
 def one(x: float, y: float) -> list[float]:
     a, b = TO_WGS.transform(x, y)
     return [round(a, 6), round(b, 6)]
+
+
+def hm(m: float) -> str:
+    return f"{int(m // 60):02d}:{int(m % 60):02d}"
 
 
 def short(name: str, n: int = 11) -> str:
@@ -95,9 +133,19 @@ def run(vi: int, fleet: int, k: int | None) -> dict:
         "v": r.v, "n": r.n, "call": r.call, "depart": r.depart,
         "pick": r.pick, "drop": r.drop, "km_rev": r.km_rev,
         "km_dead": r.km_dead, "back": r.back, "stop": r.stop, "dest": r.dest,
-        "ll": ll(r.path), "cum": _cum(r.path),
+        # 좌표를 먼저 솎고 거기서 누적길이를 뽑는다. 원본으로 누적을 재면
+        # 차량이 솎인 선 위 엉뚱한 자리에 찍힌다.
+        **dict(zip(("ll", "cum"), poly(r.path))),
+        **dict(zip(("dll", "dcum"), poly(r.path_dead))),
     } for r in s["rides"]]
     return out
+
+
+def poly(xy) -> tuple[list, list]:
+    xy = np.asarray(xy, float)
+    if len(xy) > 2:
+        xy = rdp(xy)
+    return ll(xy, tol=0), _cum(xy)
 
 
 def at_frac(path: list, cum: list[float], f: float) -> list[float]:
@@ -130,21 +178,47 @@ board_mode = c[2].radio("승차 방식", ["지정 승차장", "문 앞 호출"],
                         horizontal=True)
 K = c[3].slider("승차장 수", 4, 16, 10,
                 disabled=(board_mode == "문 앞 호출"))
-mode = c[4].radio("시각", ["지금", "직접 고르기"], horizontal=True)
+mode = c[4].radio("시각", ["재생", "지금", "직접"], horizontal=True)
 
 SIM = run(vi, fleet, K if board_mode == "지정 승차장" else None)
 END = max(sim.T1, SIM["end"])
-manual = c[5].slider("운행 시각", sim.T0, int(END), int(sim.T0 + 180),
-                     disabled=(mode == "지금")) if mode != "지금" else None
+if mode == "재생":
+    SPEED = c[5].select_slider("재생 속도", [1, 2, 4, 8, 16], value=4,
+                               format_func=lambda v: f"{v}분/초")
+    manual = None
+elif mode == "직접":
+    SPEED = 0
+    manual = c[5].slider("운행 시각", sim.T0, int(END), int(sim.T0 + 180))
+else:
+    SPEED, manual = 0, None
+    c[5].caption("실제 시각을 따라간다 (10초마다 갱신)")
+
+if "clock" not in st.session_state:
+    st.session_state.clock = float(sim.T0)
+if "tick" not in st.session_state:
+    st.session_state.tick = None
 
 STOPS = get_stops(K) if board_mode == "지정 승차장" else []
 SROUTES = get_stop_routes(K, 3) if board_mode == "지정 승차장" else []
 
 
-@st.fragment(run_every=10 if mode == "지금" else None)
+@st.fragment(run_every=0.35 if mode == "재생"
+             else 10 if mode == "지금" else None)
 def board() -> None:
     now = datetime.now(KST)
-    if mode == "지금":
+    if mode == "재생":
+        # 실제로 흐른 시간만큼 운행 시각을 밀어 차량이 이어서 움직이게 한다.
+        # 하루가 끝나면 처음으로 돌아가 계속 돈다.
+        mono = time.monotonic()
+        last = st.session_state.tick
+        st.session_state.tick = mono
+        dt = 0.0 if last is None else min(2.0, mono - last)
+        ck = st.session_state.clock + dt * SPEED
+        if ck >= END:
+            ck = float(sim.T0)
+        st.session_state.clock = ck
+        clock, phase = ck, f"재생 중 · {SPEED}분/초"
+    elif mode == "지금":
         raw = now.hour * 60 + now.minute + now.second / 60
         clock = min(max(raw, sim.T0), END)
         phase = ("운행 시작 전 — 오늘 08:30 개시" if raw < sim.T0
@@ -157,30 +231,43 @@ def board() -> None:
 def draw(clock: float, phase: str, now: datetime) -> None:
     pax = kmR = kmD = 0.0
     moving = onboard = 0
-    per = [{"pax": 0, "km": 0.0, "st": "대기"} for _ in range(fleet)]
-    vehs, waits_pt, live, waits = [], [], [], []
+    per = [{"pax": 0, "km": 0.0, "st": "대기", "pos": None, "next": None}
+           for _ in range(fleet)]
+    vehs, idle_pts, waits_pt, live, dead_live, waits = [], [], [], [], [], []
     busy_dest: dict[int, int] = {}
     for r in SIM["rides"]:
         P = per[r["v"]]
-        if clock >= r["drop"]:
+        if clock >= r["drop"]:                       # 끝난 배차
             pax += r["n"]; kmR += r["km_rev"]; kmD += r["km_dead"]
             P["pax"] += r["n"]; P["km"] += r["km_rev"] + r["km_dead"]
-        elif clock >= r["pick"]:
+            if r["ll"]:
+                P["pos"] = r["ll"][-1]               # 마지막 하차지에 서 있다
+        elif clock >= r["pick"]:                     # 승객 수송 중
             f = (clock - r["pick"]) / max(.01, r["drop"] - r["pick"])
             onboard += r["n"]; moving += 1
             kmR += r["km_rev"] * f; kmD += r["km_dead"]
             P["km"] += r["km_rev"] * f + r["km_dead"]
             P["st"] = f"승객 {r['n']}명 수송"
-            vehs.append({"lon": at_frac(r["ll"], r["cum"], f)[0],
-                         "lat": at_frac(r["ll"], r["cum"], f)[1],
-                         "n": r["n"], "v": r["v"] + 1,
-                         "lab": f"{r['n']}"})
+            p = at_frac(r["ll"], r["cum"], f)
+            P["pos"] = p
+            vehs.append({"lon": p[0], "lat": p[1], "n": r["n"],
+                         "v": r["v"] + 1, "lab": str(r["n"])})
             live.append({"path": r["ll"]})
-        elif clock >= r["depart"]:
+        elif clock >= r["depart"]:                   # 공차로 태우러 가는 중
+            f = min(1, (clock - r["depart"])
+                    / max(.01, r["pick"] - r["depart"]))
             moving += 1
-            kmD += r["km_dead"] * min(
-                1, (clock - r["depart"]) / max(.01, r["pick"] - r["depart"]))
+            kmD += r["km_dead"] * f
+            P["km"] += r["km_dead"] * f
             P["st"] = "배차 이동 (공차)"
+            if r["dll"]:
+                p = at_frac(r["dll"], r["dcum"], f)
+                P["pos"] = p
+                vehs.append({"lon": p[0], "lat": p[1], "n": 0,
+                             "v": r["v"] + 1, "lab": "→"})
+                dead_live.append({"path": r["dll"]})
+        elif P["next"] is None or r["depart"] < P["next"]:
+            P["next"] = r["depart"]                  # 다음 배차까지 쉰다
         if r["call"] <= clock < r["pick"]:
             waits.append(clock - r["call"])
             if r["ll"]:
@@ -188,15 +275,25 @@ def draw(clock: float, phase: str, now: datetime) -> None:
         if r["call"] <= clock < r["drop"]:
             busy_dest[r["dest"]] = busy_dest.get(r["dest"], 0) + r["n"]
 
+    # 쉬는 차량도 어디 있는지 보인다 — "대기"만 떠 있으면 읽히지 않는다
+    for i, P in enumerate(per):
+        if P["st"] != "대기":
+            continue
+        P["st"] = ("다음 배차 " + hm(P["next"])) if P["next"] is not None \
+            else ("운행 종료" if clock > SIM["end"] else "대기")
+        if P["pos"]:
+            idle_pts.append({"lon": P["pos"][0], "lat": P["pos"][1],
+                             "v": i + 1, "lab": str(i + 1),
+                             "tip": P["st"]})
+
     ef = sim.VEHICLES[vi]["ef"]
     km, co2 = kmR + kmD, (kmR + kmD) * ef / 1000
     base = kmR * sim.EF_TAXI / 2 / 1000
     cut = base - co2
 
-    hh, mm = int(clock // 60), int(clock % 60)
     st.markdown(
         f"<div style='font-family:monospace;font-size:1.5rem;font-weight:600'>"
-        f"<span style='color:{C1}'>●</span> {hh:02d}:{mm:02d}"
+        f"<span style='color:{C1}'>●</span> {hm(clock)}"
         f"<span style='font-size:.5em;font-weight:400;color:#777;"
         f"margin-left:10px'>{phase} · 실제 시각 {now:%Y-%m-%d %H:%M:%S} KST"
         f"</span></div>", unsafe_allow_html=True)
@@ -227,13 +324,17 @@ def draw(clock: float, phase: str, now: datetime) -> None:
 
     left, right = st.columns([2.05, 1])
     with left:
-        st.pydeck_chart(deck(live, vehs, waits_pt, clock, busy_dest),
-                        width="stretch")
+        st.pydeck_chart(
+            deck(live, dead_live, vehs, idle_pts, waits_pt, clock, busy_dest),
+            width="stretch")
         st.caption(
-            "옅은 선 = 지정 승차장에서 가까운 의원 3곳까지의 **실제 도로 경로**"
-            "(국가표준노드링크 2025-05-12) · 굵은 주황 = 지금 수송 중 · "
+            "옅은 청록 선 = 지정 승차장에서 가까운 의원 3곳까지의 **실제 도로"
+            " 경로**(국가표준노드링크 2025-05-12) · 굵은 주황 = 지금 승객을"
+            " 태우고 달리는 구간 · 회색 선 = 공차로 태우러 가는 구간 · "
             "청록 큰 점 = 지정 승차장(크기는 맡은 고령인구) · "
-            "보라 = 의원(크기는 의사 수, 붉을수록 혼잡) · 사각 = 차량")
+            "보라 = 의원(크기는 의사 수, 붉을수록 혼잡) · "
+            "진보라 점 = 운행 중 차량(숫자는 탑승, → 는 공차) · "
+            "회색 점 = 쉬는 차량(번호는 차량)")
     with right:
         st.markdown("**의원 실시간 현황** &nbsp;"
                     "<span style='font-family:monospace;font-size:.62rem;"
@@ -322,7 +423,7 @@ def base_layers() -> dict:
             "view": (float(np.mean(lon)), float(np.mean(lat)))}
 
 
-def deck(live, vehs, waits, clock: float, busy) -> pdk.Deck:
+def deck(live, dead, vehs, idle, waits, clock: float, busy) -> pdk.Deck:
     B = base_layers()
     L = [pdk.Layer("PolygonLayer", B["dong"], get_polygon="polygon",
                    stroked=True, filled=False,
@@ -386,6 +487,11 @@ def deck(live, vehs, waits, clock: float, busy) -> pdk.Deck:
             font_family="'Malgun Gothic, Apple SD Gothic Neo, sans-serif'",
             character_set="'auto'", pickable=False))
 
+    if dead:
+        L.append(pdk.Layer("PathLayer", dead, get_path="path",
+                           get_color=[140, 148, 153, 160], get_width=14,
+                           width_min_pixels=2, cap_rounded=True,
+                           joint_rounded=True))
     if live:
         L.append(pdk.Layer("PathLayer", live, get_path="path",
                            get_color=[184, 84, 15, 225], get_width=28,
@@ -414,6 +520,17 @@ def deck(live, vehs, waits, clock: float, busy) -> pdk.Deck:
                            line_width_min_pixels=1.5, pickable=True))
         L.append(pdk.Layer("TextLayer", sdf, get_position=["lon", "lat"],
                            get_text="lab", get_size=11, get_color=[255] * 3,
+                           get_alignment_baseline="'center'",
+                           font_weight=700, character_set="'auto'"))
+    if idle:
+        L.append(pdk.Layer("ScatterplotLayer", idle,
+                           get_position=["lon", "lat"], get_radius=240,
+                           radius_min_pixels=6, radius_max_pixels=14,
+                           get_fill_color=[140, 148, 153, 195],
+                           stroked=True, get_line_color=[255, 255, 255, 205],
+                           line_width_min_pixels=1, pickable=True))
+        L.append(pdk.Layer("TextLayer", idle, get_position=["lon", "lat"],
+                           get_text="lab", get_size=10, get_color=[255] * 3,
                            get_alignment_baseline="'center'",
                            font_weight=700, character_set="'auto'"))
     if vehs:

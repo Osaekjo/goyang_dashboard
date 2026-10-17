@@ -131,6 +131,7 @@ class Ride:
     km_rev: float     # 수송거리
     km_dead: float    # 공차거리
     path: np.ndarray  # 수송 구간 도로 모양 (EPSG:5179)
+    path_dead: np.ndarray  # 공차 구간(직전 하차지→승차지) 도로 모양
     back: int         # 0 집→의원 · 1 의원→집
     stop: int         # 지정 승차장 번호 (문앞 호출이면 -1)
     dest: int         # 의료기관 번호
@@ -240,6 +241,9 @@ def simulate(road: Road, meta: dict, veh: dict, fleet: int,
             if arr < best_t:
                 best, best_t, best_d = v, arr, dk
         v, km_dead, pick = best, best_d, best_t
+        # 공차 구간도 도로로 그린다 — 안 그리면 배차 이동 중 차가 멈춰 보인다
+        pd_ = (road.path_xy(pred[row[at[v]]], at[v], a)
+               if at[v] is not None and at[v] in row else np.empty((0, 2)))
         km_rev = dist[row[a], b] / 1000
         if not np.isfinite(km_rev):
             km_rev = math.hypot(g["bx"] - g["ax"], g["by"] - g["ay"]) / 1000 * 1.4
@@ -249,7 +253,7 @@ def simulate(road: Road, meta: dict, veh: dict, fleet: int,
         at[v] = b
         rides.append(Ride(v, len(grp), g["t"], depart, pick, drop,
                           km_rev, km_dead, road.path_xy(pred[row[a]], a, b),
-                          g["back"], g["stop"], g["dest"]))
+                          pd_, g["back"], g["stop"], g["dest"]))
 
     pax = sum(r.n for r in rides)
     km_rev = sum(r.km_rev for r in rides)
