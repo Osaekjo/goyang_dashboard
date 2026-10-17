@@ -139,25 +139,67 @@ def reach_of(k: int, fleet_: int, budget: int) -> dict:
 
 
 # ── 핵심 수치 ─────────────────────────────────────────────────────────
-k = st.columns([1.5, 1, 1, 1, 1])
+# 이 화면이 묻는 것은 하나다. 그것만 크게 띄우고 나머지는 작게 받친다.
 delta = 100 * (R0["new_share"] - R0["now_share"])
-k[0].metric(f"{BUD}분 안에 병원에 닿는 고령인구",
-            f"{100 * R0['new_share']:.1f}%",
-            f"현행 {100 * R0['now_share']:.1f}% 에서 "
-            f"{delta:+.1f}%포인트",
-            delta_color="normal" if delta > 0 else "off")
-k[1].metric("새로 닿게 되는 사람", f"{R0['gain_pop']:,.0f}명",
-            f"고령 {M['고령']:,.0f}명 가운데", delta_color="off")
-k[2].metric("그래도 못 닿는 사람", f"{R0['still_pop']:,.0f}명",
-            f"현행 {M['고령'] - R0['now_pop']:,.0f}명 에서",
-            delta_color="off")
+now_p, new_p = 100 * R0["now_share"], 100 * R0["new_share"]
+w_now = now_p
+w_gain = max(0.0, new_p - now_p)
+w_no = max(0.0, 100 - new_p)
+st.markdown(f"""
+<div style="background:linear-gradient(103deg,#0f5a66 0%,#16707f 46%,
+     #2a8d93 100%);border-radius:14px;padding:22px clamp(18px,3vw,34px) 20px;
+     color:#fff;margin:4px 0 14px">
+  <div style="font-size:.9rem;letter-spacing:.02em;opacity:.84;
+       font-weight:500">{BUD}분 안에 병원에 닿는 고령인구</div>
+  <div style="display:flex;align-items:baseline;gap:clamp(10px,2.2vw,26px);
+       flex-wrap:wrap;margin-top:6px">
+    <div style="font-family:'IBM Plex Mono',ui-monospace,monospace;
+         font-size:clamp(1.5rem,3.4vw,2.4rem);font-weight:600;opacity:.62;
+         line-height:1">{now_p:.1f}%</div>
+    <div style="font-size:clamp(1.1rem,2.4vw,1.7rem);opacity:.6;
+         line-height:1">→</div>
+    <div style="font-family:'IBM Plex Mono',ui-monospace,monospace;
+         font-size:clamp(3rem,9vw,5.4rem);font-weight:700;line-height:.95;
+         letter-spacing:-.02em">{new_p:.1f}<span
+         style="font-size:.42em;font-weight:500;opacity:.82">%</span></div>
+    <div style="font-family:'IBM Plex Mono',ui-monospace,monospace;
+         font-size:clamp(1.1rem,2.6vw,1.9rem);font-weight:700;
+         background:rgba(255,255,255,.17);border-radius:8px;
+         padding:5px 13px;line-height:1.2">{delta:+.1f}%p</div>
+  </div>
+  <div style="display:flex;height:16px;border-radius:8px;overflow:hidden;
+       margin-top:16px;background:rgba(255,255,255,.14)">
+    <div style="width:{w_now:.2f}%;background:rgba(255,255,255,.52)"></div>
+    <div style="width:{w_gain:.2f}%;background:#ffd08a"></div>
+    <div style="width:{w_no:.2f}%;background:rgba(0,0,0,.26)"></div>
+  </div>
+  <div style="display:flex;gap:18px 26px;flex-wrap:wrap;margin-top:11px;
+       font-size:.86rem">
+    <span><b style="font-size:1.12rem">{R0['now_pop']:,.0f}명</b>
+      <span style="opacity:.8">원래 닿던 사람</span></span>
+    <span style="color:#ffd08a"><b style="font-size:1.12rem">
+      +{R0['gain_pop']:,.0f}명</b> 새로 닿게 됨</span>
+    <span style="opacity:.78"><b style="font-size:1.12rem">
+      {R0['still_pop']:,.0f}명</b> 그래도 못 닿음
+      <span style="opacity:.8">(현행 {M['고령'] - R0['now_pop']:,.0f}명)</span>
+    </span>
+    <span style="opacity:.62;margin-left:auto">대상 고령 {M['고령']:,.0f}명 ·
+      {VEH[vi]['name']} {fleet}대 · 승차장 {K}곳</span>
+  </div>
+</div>""", unsafe_allow_html=True)
+
 cut = float(carbon_of(pd.DataFrame([cur])).iloc[0])
-k[3].metric("연간 탄소", ("± 0.0 t" if abs(cut) < .05 else
+k = st.columns(4)
+k[0].metric("평균 대기", f"{cur.wait:,.0f}분",
+            f"10번 중 1번은 {cur.wait_p90:,.0f}분 이상", delta_color="off")
+k[1].metric("집→승차장 보행", f"{R0['walk_min']:.1f}분",
+            f"중앙 {cur.walk_med:,.0f} m · 0.8 m/s", delta_color="off")
+k[2].metric("연간 탄소", ("± 0.0 t" if abs(cut) < .05 else
                        f"{'▲ +' if cut >= 0 else '▼ −'}{abs(cut):,.1f} t"),
             f"현행 {bl} 대비", delta_color="off" if abs(cut) < .05
             else "normal" if cut >= 0 else "inverse")
-k[4].metric("연간 운영비", f"{cur.cost_year / 1e8:,.1f}억원",
-            f"새로 닿는 1인당 "
+k[3].metric("연간 운영비", f"{cur.cost_year / 1e8:,.1f}억원",
+            "새로 닿는 1인당 "
             + (f"{cur.cost_year / R0['gain_pop'] / 1e4:,.0f}만원"
                if R0["gain_pop"] > 0 else "—"), delta_color="off")
 
