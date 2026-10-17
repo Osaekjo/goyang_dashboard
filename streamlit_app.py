@@ -55,6 +55,18 @@ def one(x: float, y: float) -> list[float]:
     return [round(a, 6), round(b, 6)]
 
 
+def short(name: str, n: int = 11) -> str:
+    """지도 라벨용으로 기관명을 줄인다. 꼬리의 '의원·병원'은 떼지 않는다."""
+    s = str(name).strip()
+    return s if len(s) <= n else s[:n - 1] + "…"
+
+
+def charset(labels) -> list[str]:
+    """deck.gl TextLayer 는 기본 문자셋이 ASCII 라 한글이 빈칸으로 나온다.
+    쓰는 글자를 모두 넘겨 글자판을 만들게 한다."""
+    return sorted({c for s in labels for c in str(s)})
+
+
 def _cum(xy) -> list[float]:
     xy = np.asarray(xy, float)
     if len(xy) < 2:
@@ -260,21 +272,26 @@ def draw(clock: float, phase: str, now: datetime) -> None:
 
 
 # ── 의원 현황 ─────────────────────────────────────────────────────────
-def clinic_table(clock: float, busy: dict[int, int]) -> pd.DataFrame:
+def focus_dests() -> tuple[list[int], dict[int, float]]:
+    """화면에 이름을 띄울 의원 — 승차장이 닿는 곳, 없으면 수요가 많은 곳."""
     if SROUTES:
         idx, seen = [], set()
         for r in sorted(SROUTES, key=lambda r: (r["rank"], r["km"])):
             if r["dest"] not in seen:
-                seen.add(r["dest"]); idx.append(r["dest"])
-        near = {r["dest"]: min(
-            x["km"] for x in SROUTES if x["dest"] == r["dest"])
-            for r in SROUTES}
-    else:
-        cnt: dict[int, int] = {}
-        for r in SIM["rides"]:
-            cnt[r["dest"]] = cnt.get(r["dest"], 0) + r["n"]
-        idx = sorted(cnt, key=lambda j: -cnt[j])[:14]
-        near = {j: 0.0 for j in idx}
+                seen.add(r["dest"])
+                idx.append(r["dest"])
+        near = {j: min(x["km"] for x in SROUTES if x["dest"] == j)
+                for j in idx}
+        return idx, near
+    cnt: dict[int, int] = {}
+    for r in SIM["rides"]:
+        cnt[r["dest"]] = cnt.get(r["dest"], 0) + r["n"]
+    idx = sorted(cnt, key=lambda j: -cnt[j])[:14]
+    return idx, {j: 0.0 for j in idx}
+
+
+def clinic_table(clock: float, busy: dict[int, int]) -> pd.DataFrame:
+    idx, near = focus_dests()
     rows = []
     for s in sim.clinic_status(META, idx[:14], clock):
         rows.append({
@@ -349,6 +366,29 @@ def deck(live, vehs, waits, clock: float, busy) -> pdk.Deck:
                        radius_max_pixels=22, get_fill_color="col",
                        pickable=True, stroked=False))
 
+    # 의원 이름과 현재 대기 — 지도 위에 직접. 이름은 실제, 대기는 가상이다.
+    idx, _ = focus_dests()
+    lab = pd.DataFrame([{
+        "lon": float(d.lon.iloc[j]), "lat": float(d.lat.iloc[j]),
+        "lab": f"{short(d['name'].iloc[j])}  "
+               + ("휴진" if st_now[j]["on"] == 0
+                  else f"대기 {st_now[j]['waiting']}명"),
+        "col": [120, 128, 134] if st_now[j]["on"] == 0 else
+               [150, 62, 8] if st_now[j]["wait_min"] >= 30 else
+               [40, 52, 60]} for j in idx])
+    if len(lab):
+        L.append(pdk.Layer(
+            "TextLayer", lab, get_position=["lon", "lat"], get_text="lab",
+            get_color="col", get_size=12,
+            get_text_anchor="'start'", get_alignment_baseline="'center'",
+            get_pixel_offset=[13, 0], background=True,
+            get_background_color=[255, 255, 255, 226],
+            background_padding=[5, 3, 5, 3], font_weight=600,
+            # pydeck 은 문자열 kwarg 를 JS 표현식으로 감싼다(@@=). 그래서 전체를
+            # 한 쌍의 따옴표로 묶어야 문자열 하나로 평가된다.
+            font_family="'Malgun Gothic, Apple SD Gothic Neo, sans-serif'",
+            character_set=charset(lab.lab), pickable=False))
+
     if live:
         L.append(pdk.Layer("PathLayer", live, get_path="path",
                            get_color=[184, 84, 15, 225], get_width=28,
@@ -377,7 +417,8 @@ def deck(live, vehs, waits, clock: float, busy) -> pdk.Deck:
                            line_width_min_pixels=1.5, pickable=True))
         L.append(pdk.Layer("TextLayer", sdf, get_position=["lon", "lat"],
                            get_text="lab", get_size=11, get_color=[255] * 3,
-                           get_alignment_baseline="'center'"))
+                           get_alignment_baseline="'center'",
+                           font_weight=700, character_set=charset(sdf.lab)))
     if vehs:
         L.append(pdk.Layer("ScatterplotLayer", vehs,
                            get_position=["lon", "lat"], get_radius=320,
@@ -385,7 +426,9 @@ def deck(live, vehs, waits, clock: float, busy) -> pdk.Deck:
                            get_fill_color=[70, 40, 120, 240], pickable=True))
         L.append(pdk.Layer("TextLayer", vehs, get_position=["lon", "lat"],
                            get_text="lab", get_size=11, get_color=[255] * 3,
-                           get_alignment_baseline="'center'"))
+                           get_alignment_baseline="'center'",
+                           font_weight=700,
+                           character_set=charset(v["lab"] for v in vehs)))
     return pdk.Deck(
         layers=L, map_provider="carto", map_style="light",
         initial_view_state=pdk.ViewState(
