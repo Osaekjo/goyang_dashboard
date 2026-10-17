@@ -62,7 +62,26 @@ def render(payload: dict, height: int = 520) -> None:
     html = _HTML.replace("__SDK__", SDK.format(key=key))
     html = html.replace("__DATA__", json.dumps(payload, ensure_ascii=False))
     html = html.replace("__H__", str(height))
-    components.html(html, height=height + 6, scrolling=False)
+    _embed(html, height)
+
+
+def _embed(html: str, height: int) -> None:
+    """components.v1.html 은 폐기 예고가 붙었다. 사라지면 st.html 로 넘어간다.
+
+    st.iframe 은 주소만 받으므로 HTML 문자열에는 쓸 수 없고, data: URI 는
+    출처가 비어 Referer 가 안 나가 카카오 도메인 검사에 걸린다. 그래서
+    iframe(components.html) → 본문 삽입(st.html) 순으로 간다.
+    """
+    try:
+        components.html(html, height=height + 6, scrolling=False)
+        return
+    except Exception:
+        pass
+    try:
+        st.html(html, unsafe_allow_javascript=True)
+    except Exception as e:
+        st.error(f"지도를 띄우지 못했습니다 ({type(e).__name__}). "
+                 "배경지도에서 VWorld 를 쓰세요.", icon="🗺️")
 
 
 _HTML = r"""
