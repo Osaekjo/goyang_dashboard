@@ -393,6 +393,95 @@ def stop_routes(road: Road, stops: list[dict], meta: dict,
     return out
 
 
+# ── 도달 ──────────────────────────────────────────────────────────────
+def reach_tables(road: Road, meta: dict, stops: list[dict],
+                 km_table: dict | None = None,
+                 max_min: int = 90) -> dict:
+    """도달 계산에 필요한 것만 추려 둔다.
+
+    도입 후 한 사람의 문앞-의원 시간은
+        집→승차장 보행  +  대기  +  승차장→의원 차내
+    이고, 예산 안에 드는 의료기관 수가 그 사람의 도달 기관수다.
+
+    대기는 대수에 따라 달라지고 보행·차내는 승차장 배치에 따라 달라지므로,
+    **승차장별 차내시간 누적분포**와 **출발점별 보행시간**만 구워 두면 화면에서
+    (예산, 대기) 를 바꿔도 즉시 다시 셀 수 있다.
+
+    되돌려 주는 것
+      cell_stop   출발점마다 배정된 승차장 번호
+      cell_walk   그 승차장까지 보행시간 (분, 0.8 m/s)
+      cell_pop    출발점 고령인구
+      cell_now    현행 30분 주점수 A_r (곳)
+      hist        승차장 × (0..max_min) — 차내시간이 t분 이하인 의료기관 수
+    """
+    cells = [c for c in meta["cells"] if c[4] and c[3] > 0]
+    P = np.array([[c[0] + 125, c[1] + 125] for c in cells], float)
+    pop = np.array([c[3] for c in cells], float)
+    now = np.array([c[2] for c in cells], float)
+
+    sx = np.array([s["x"] for s in stops])
+    sy = np.array([s["y"] for s in stops])
+    d = np.hypot(P[:, None, 0] - sx[None], P[:, None, 1] - sy[None])
+    cs = d.argmin(1)
+    walk = d[np.arange(len(P)), cs] / 0.8 / 60          # 분
+
+    dest = np.array([[x[0], x[1]] for x in meta["dest"]], float)
+    dn = road.snap(dest)
+    row, dist, _ = road.solve(np.array([s["node"] for s in stops]))
+    T = km_table or {}
+    hist = np.zeros((len(stops), max_min + 1), np.int32)
+    for s in stops:
+        km = dist[row[s["node"]], dn] / 1000
+        for j in range(len(dest)):                      # 카카오 값이 있으면 쓴다
+            v = T.get((("S", s["i"]), ("D", j)))
+            if v is not None:
+                km[j] = v
+        t = km / SPEED_KMH * 60
+        t = t[np.isfinite(t)]
+        hist[s["i"]] = np.bincount(
+            np.clip(np.ceil(t).astype(int), 0, max_min),
+            minlength=max_min + 1).cumsum()
+    return {"cell_stop": cs.tolist(), "cell_walk": np.round(walk, 2).tolist(),
+            "cell_pop": pop.tolist(), "cell_now": now.tolist(),
+            "cell_xy": [[int(c[0]), int(c[1])] for c in cells],
+            "hist": hist.tolist(), "max_min": max_min}
+
+
+def reach(tab: dict, budget: float, wait: float) -> dict:
+    """예산과 대기를 주면 도달 결과를 센다. 화면에서 매번 부른다."""
+    cs = np.asarray(tab["cell_stop"])
+    walk = np.asarray(tab["cell_walk"], float)
+    pop = np.asarray(tab["cell_pop"], float)
+    now = np.asarray(tab["cell_now"], float)
+    H = np.asarray(tab["hist"])
+    avail = np.clip(np.floor(budget - wait - walk).astype(int),
+                    -1, tab["max_min"])
+    cnt = np.where(avail < 0, 0, H[cs, np.clip(avail, 0, None)])
+    tot = pop.sum()
+    # 똑버스가 들어와도 기존 대중교통이 없어지지 않는다. 사람은 **둘 중 나은
+    # 쪽**을 쓰므로 도입 후 도달은 현행과 똑버스의 합집합이다.
+    both = (now > 0) | (cnt > 0)
+    return {
+        "per_cell": cnt,
+        "per_cell_now": now,
+        "pop": tot,
+        "now_pop": float(pop[now > 0].sum()),
+        "now_share": float(pop[now > 0].sum() / tot),
+        "now_A": float((now * pop).sum() / tot),
+        "drt_pop": float(pop[cnt > 0].sum()),          # 똑버스만으로
+        "drt_share": float(pop[cnt > 0].sum() / tot),
+        "new_pop": float(pop[both].sum()),             # 도입 후 (합집합)
+        "new_share": float(pop[both].sum() / tot),
+        "new_A": float((np.maximum(now, cnt) * pop).sum() / tot),
+        "gain_pop": float(pop[(cnt > 0) & (now <= 0)].sum()),
+        "still_pop": float(pop[~both].sum()),          # 그래도 못 닿는
+        "walk_min": float(np.average(walk, weights=pop)),
+        "ride_min": float(np.average(
+            np.where(cnt > 0, budget - wait - walk, np.nan)[cnt > 0],
+            weights=pop[cnt > 0])) if (cnt > 0).any() else 0.0,
+    }
+
+
 # ── 의원 실시간 현황 (가상) ───────────────────────────────────────────
 def clinic_status(meta: dict, idx: list[int], clock: float,
                   seed: int = 20261016) -> list[dict]:

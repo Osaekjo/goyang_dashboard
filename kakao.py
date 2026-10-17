@@ -29,6 +29,8 @@ from pathlib import Path
 import numpy as np
 import requests
 
+import keys
+
 HERE = Path(__file__).resolve().parent
 CACHE = HERE / "data" / "kakao_cache.json"
 MATRIX_URL = "https://apis-navi.kakaomobility.com/v1/destinations/directions"
@@ -37,42 +39,9 @@ MAX_DEST = 30               # /v1/destinations 한 번에 묻을 수 있는 목�
 PAUSE = 0.12                # 연속 호출 사이 간격 (초)
 
 
-# 쓰는 사람마다 이름을 달리 적는다. 둘 다 받는다.
-KEY_NAMES = ("KAKAO_REST_API_KEY", "KAKAO_REST_KEY")
-
-
-def _clean(v: str) -> str:
-    v = v.strip().strip('"').strip("'").strip()
-    # 안 채운 자리표시자를 키로 착각하지 않는다
-    return "" if (not v or "여기에" in v or v.lower() in {"none", "null"}) else v
-
-
 def api_key() -> str | None:
-    """환경변수 → .env → Streamlit Secrets 순으로 찾는다."""
-    for n in KEY_NAMES:
-        k = _clean(os.environ.get(n, ""))
-        if k:
-            return k
-    env = HERE / ".env"
-    if env.exists():
-        for line in env.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if line.startswith("#") or "=" not in line:
-                continue
-            name, _, val = line.partition("=")
-            if name.strip() in KEY_NAMES:
-                k = _clean(val)
-                if k:
-                    return k
-    try:
-        import streamlit as st
-        for n in KEY_NAMES:
-            k = _clean(str(st.secrets.get(n, "")))
-            if k:
-                return k
-    except Exception:
-        pass
-    return None
+    """키 읽기는 keys.py 가 맡는다."""
+    return keys.get(*keys.KAKAO)
 
 
 def _load() -> dict:

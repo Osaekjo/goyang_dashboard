@@ -97,7 +97,7 @@ def main(use_kakao: bool, write: bool) -> None:
         kk = kakao.Kakao()
         print(f"[카카오] 키 {'있음' if kk.ok else '없음 → 도로망으로 진행'}")
 
-    rows, stops_out = [], {}
+    rows, stops_out, reach_out = [], {}, {}
     for k in K_RANGE:
         stops = sim.designated_stops(road, meta, k)
         table = {}
@@ -105,6 +105,9 @@ def main(use_kakao: bool, write: bool) -> None:
             table, got = kakao_table(road, meta, stops, kk)
             kk.flush()
             print(f"  승차장 {k:>2}곳 · 카카오 거리 {got:,}쌍 · {kk.report()}")
+        # 도달 계산용 표 — 화면에서 (예산, 대기) 를 바꿔도 즉시 다시 센다
+        reach_out[str(k)] = sim.reach_tables(road, meta, stops,
+                                             table or None)
         stops_out[str(k)] = [{
             "i": s["i"], "name": s["name"],
             "lon": lonlat(s["x"], s["y"])[0], "lat": lonlat(s["x"], s["y"])[1],
@@ -152,7 +155,7 @@ def main(use_kakao: bool, write: bool) -> None:
     if kk:
         kk.flush()
     out = {
-        "rows": rows, "stops": stops_out,
+        "rows": rows, "stops": stops_out, "reach": reach_out,
         "vehicles": [{"id": v["id"], "name": v["name"], "ef": round(v["ef"], 1),
                       "ef_hi": round(v["ef_hi"], 1) if v["ef_hi"] else None,
                       "cap": v["cap"]} for v in sim.VEHICLES],
@@ -163,6 +166,15 @@ def main(use_kakao: bool, write: bool) -> None:
                  "trips": rows[0]["km"] and sim.TRIPS_PER_YEAR},
     }
     print(f"\n[표] {len(rows):,}행 · 승차장 집합 {len(stops_out)}개")
+    for k in (6, 10, 14):
+        tb = reach_out[str(k)]
+        w = next(r["wait"] for r in rows if r["k"] == k
+                 and r["fleet"] == 7 and r["vi"] == 1)
+        r0 = sim.reach(tb, 30, w)
+        print(f"  승차장 {k:>2}곳 · 7대(대기 {w:.0f}분) · 30분 도달 고령 "
+              f"{100 * r0['now_share']:.1f}% → "
+              f"{100 * r0['new_share']:.1f}% "
+              f"(+{r0['gain_pop']:.0f}명)")
     best = min((r for r in rows if r["in_hours"] and r["wait"] <= 40),
                key=lambda r: (-r["cut_year_t"], r["walk_med"]), default=None)
     if best:
