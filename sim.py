@@ -132,10 +132,17 @@ class Ride:
     km_dead: float    # 공차거리
     path: np.ndarray  # 수송 구간 도로 모양 (EPSG:5179)
     back: int         # 0 집→의원 · 1 의원→집
+    stop: int         # 지정 승차장 번호 (문앞 호출이면 -1)
+    dest: int         # 의료기관 번호
 
 
 def simulate(road: Road, meta: dict, veh: dict, fleet: int,
-             seed: int = 20261016) -> dict:
+             seed: int = 20261016, stops: list[dict] | None = None) -> dict:
+    """stops 를 주면 **지정 승차장**에서 태운다. 안 주면 문 앞에서 태운다.
+
+    승차장을 쓰면 같은 자리에서 출발하는 호출이 늘어 합승이 잘 되고 공차가
+    줄지만, 고령자가 승차장까지 걸어야 한다. 그 보행거리도 함께 돌려준다.
+    """
     rnd = np.random.default_rng(seed)
     cells = [c for c in meta["cells"] if c[4] and c[3] > 0]
     w = np.array([c[3] for c in cells], float)
@@ -158,19 +165,36 @@ def simulate(road: Road, meta: dict, veh: dict, fleet: int,
         p = dw / (1 + km) ** 6.0
         di[i] = rnd.choice(len(dest), p=p / p.sum())
 
-    o_node = road.snap(np.c_[ox[oi], oy[oi]])
+    # 승차 지점 — 지정 승차장이면 가장 가까운 승차장, 아니면 문 앞
+    walk = np.zeros(n_trip)
+    stop_of = np.full(n_trip, -1)
+    if stops:
+        sx = np.array([s["x"] for s in stops])
+        sy = np.array([s["y"] for s in stops])
+        for i in range(n_trip):
+            d = np.hypot(sx - ox[oi[i]], sy - oy[oi[i]])
+            stop_of[i] = int(np.argmin(d))
+            walk[i] = float(d[stop_of[i]])
+        px = sx[stop_of]
+        py = sy[stop_of]
+        o_node = np.array([stops[j]["node"] for j in stop_of])
+    else:
+        px, py = ox[oi], oy[oi]
+        o_node = road.snap(np.c_[px, py])
     d_node = road.snap(dest[di])
     row, dist, pred = road.solve(np.r_[o_node, d_node])
 
     legs = []
     for i in range(n_trip):
         legs.append({"t": t_call[i], "a": int(o_node[i]), "b": int(d_node[i]),
-                     "ax": ox[oi[i]], "ay": oy[oi[i]],
-                     "bx": dest[di[i], 0], "by": dest[di[i], 1], "back": 0})
+                     "ax": px[i], "ay": py[i],
+                     "bx": dest[di[i], 0], "by": dest[di[i], 1], "back": 0,
+                     "stop": int(stop_of[i]), "dest": int(di[i])})
         legs.append({"t": t_call[i] + CARE, "a": int(d_node[i]),
                      "b": int(o_node[i]),
                      "ax": dest[di[i], 0], "ay": dest[di[i], 1],
-                     "bx": ox[oi[i]], "by": oy[oi[i]], "back": 1})
+                     "bx": px[i], "by": py[i], "back": 1,
+                     "stop": int(stop_of[i]), "dest": int(di[i])})
     legs.sort(key=lambda r: r["t"])
 
     # 합승
@@ -225,17 +249,22 @@ def simulate(road: Road, meta: dict, veh: dict, fleet: int,
         at[v] = b
         rides.append(Ride(v, len(grp), g["t"], depart, pick, drop,
                           km_rev, km_dead, road.path_xy(pred[row[a]], a, b),
-                          g["back"]))
+                          g["back"], g["stop"], g["dest"]))
 
     pax = sum(r.n for r in rides)
     km_rev = sum(r.km_rev for r in rides)
     km_dead = sum(r.km_dead for r in rides)
     wait = sum((r.pick - r.call) * r.n for r in rides) / pax
+    ww = np.repeat(walk, 2)          # 구간마다 같은 보행이 한 번씩 붙는다
     return {"rides": rides, "trips": n_trip, "pax": pax, "fleet": fleet,
             "occ": pax / len(rides), "km_rev": km_rev, "km_dead": km_dead,
             "km": km_rev + km_dead, "wait": wait,
             "end": max(r.drop for r in rides), "veh": veh,
-            "dead_share": km_dead / (km_rev + km_dead)}
+            "dead_share": km_dead / (km_rev + km_dead),
+            "stops": bool(stops),
+            "walk_med": float(np.median(ww)) if stops else 0.0,
+            "walk_max": float(ww.max()) if stops else 0.0,
+            "walk_min_med": float(np.median(ww)) / 0.8 / 60 if stops else 0.0}
 
 
 # ── 탄소 ──────────────────────────────────────────────────────────────
@@ -256,6 +285,132 @@ def carbon(sim: dict, ef: float | None = None) -> dict:
         "breakeven": ef / (EF_TAXI / 2),
         "breakeven_dead": ef / (EF_TAXI / 2) / (1 - sim["dead_share"]),
     }
+
+
+# ── 지정 승차장 ───────────────────────────────────────────────────────
+def designated_stops(road: Road, meta: dict, k: int = 10,
+                     seed: int = 20261016) -> list[dict]:
+    """고령인구 밀집에 맞춰 승차장 후보를 뽑는다 — **분석 전 임시 가정**.
+
+    실제 승차장 선정은 별도 분석(보행 접근권, 정차 가능 지점, 소유관계)이
+    필요하다. 여기서는 고령인구를 가중치로 둔 k-평균 중심을 도로 노드에 붙여
+    자리만 잡아 둔다. 나중에 실제 목록이 나오면 이 함수만 갈아끼우면 된다.
+
+    되돌려 주는 것
+      x, y        EPSG:5179 (도로 노드로 스냅한 자리)
+      node        도로망 노드 번호
+      pop         이 승차장이 맡는 고령인구
+      walk_med    맡은 격자에서 승차장까지 보행거리 중앙 (m)
+      walk_max    같은 것의 최대 (m)
+    """
+    cells = [c for c in meta["cells"] if c[4] and c[3] > 0]
+    P = np.array([[c[0] + 125, c[1] + 125] for c in cells], float)
+    w = np.array([c[3] for c in cells], float)
+
+    rnd = np.random.default_rng(seed)
+    # k-평균++ 로 씨앗을 고른다 — 인구가 많은 쪽이 뽑히게 가중한다
+    cen = [P[rnd.choice(len(P), p=w / w.sum())]]
+    for _ in range(k - 1):
+        d2 = np.min([((P - c) ** 2).sum(1) for c in cen], axis=0) * w
+        cen.append(P[rnd.choice(len(P), p=d2 / d2.sum())])
+    cen = np.array(cen)
+    for _ in range(80):
+        lab = np.argmin(((P[:, None, :] - cen[None]) ** 2).sum(2), axis=1)
+        new = cen.copy()
+        for j in range(k):
+            m = lab == j
+            if m.any():
+                new[j] = (P[m] * w[m, None]).sum(0) / w[m].sum()
+        if np.allclose(new, cen, atol=.5):
+            cen = new
+            break
+        cen = new
+
+    node = road.snap(cen)
+    sx, sy = road.nx[node], road.ny[node]            # 도로에 붙인 실제 자리
+    out = []
+    for j in range(k):
+        m = lab == j
+        if not m.any():
+            continue
+        d = np.hypot(P[m, 0] - sx[j], P[m, 1] - sy[j])
+        out.append({"i": len(out), "x": float(sx[j]), "y": float(sy[j]),
+                    "node": int(node[j]), "pop": float(w[m].sum()),
+                    "cells": int(m.sum()),
+                    "walk_med": float(np.median(d)),
+                    "walk_max": float(d.max())})
+    out.sort(key=lambda s: -s["pop"])
+    for i, s in enumerate(out):
+        s["i"] = i
+        s["name"] = f"가좌·송포 {i + 1:02d}"
+    return out
+
+
+def stop_routes(road: Road, stops: list[dict], meta: dict,
+                per_stop: int = 3) -> list[dict]:
+    """승차장마다 가까운 의원 몇 곳까지의 실제 도로 경로."""
+    dest = np.array([[d[0], d[1]] for d in meta["dest"]], float)
+    dn = road.snap(dest)
+    row, dist, pred = road.solve(np.array([s["node"] for s in stops]))
+    out = []
+    for s in stops:
+        dv = dist[row[s["node"]], dn]
+        order = np.argsort(dv)[:per_stop]
+        for rank, j in enumerate(order):
+            if not np.isfinite(dv[j]):
+                continue
+            d = meta["dest"][int(j)]
+            out.append({
+                "stop": s["i"], "stop_name": s["name"], "dest": int(j),
+                "name": d[5], "kind": d[6], "doctors": d[7],
+                "internal": d[2], "km": float(dv[j]) / 1000,
+                "min": float(dv[j]) / 1000 / SPEED_KMH * 60, "rank": rank,
+                "path": road.path_xy(pred[row[s["node"]]], s["node"], int(dn[j])),
+            })
+    return out
+
+
+# ── 의원 실시간 현황 (가상) ───────────────────────────────────────────
+def clinic_status(meta: dict, idx: list[int], clock: float,
+                  seed: int = 20261016) -> list[dict]:
+    """의원별 현재 진료 의사 수와 대기 환자 — **가상 자료**.
+
+    건강보험심사평가원은 기관별 인력 현황을 공개하지만 **실시간 진료 인원이나
+    대기 환자를 주는 공개 API 는 없다.** 아래 값은 그런 API 가 있다고 치고
+    만든 것이며 실제가 아니다. 뒷날 연동한다면 이 함수만 갈아끼우면 된다.
+
+    그럴듯하게 두려고 세 가지를 지킨다.
+      · 점심(12:30~14:00)과 18시 이후에는 진료 인원이 줄거나 0 이 된다
+      · 대기 환자는 오전 9~11시와 오후 2~4시에 몰린다
+      · 같은 의원·같은 분이면 언제나 같은 값이 나온다(시드 고정)
+    """
+    out = []
+    for j in idx:
+        d = meta["dest"][j]
+        staff = max(1, int(d[7]))
+        rnd = np.random.default_rng(seed + j * 7919)
+        h = clock / 60
+        if h < 9 or h >= 18:
+            open_ratio = 0.0
+        elif 12.5 <= h < 14:
+            open_ratio = 0.35
+        elif h >= 17:
+            open_ratio = 0.6
+        else:
+            open_ratio = 1.0
+        on = int(round(staff * open_ratio * (0.75 + 0.5 * rnd.random())))
+        on = min(staff, max(0 if open_ratio == 0 else 1, on))
+        # 혼잡도 — 오전·오후 봉우리 두 개
+        peak = (np.exp(-((h - 10.0) / 1.5) ** 2)
+                + 0.8 * np.exp(-((h - 15.0) / 1.6) ** 2))
+        waiting = 0 if on == 0 else int(round(
+            on * 4.5 * peak * (0.6 + 0.8 * rnd.random())))
+        wait_min = 0 if on == 0 else int(round(waiting / on * 6.5))
+        out.append({"dest": j, "name": d[5], "kind": d[6],
+                    "staff": staff, "on": on, "waiting": waiting,
+                    "wait_min": wait_min, "internal": d[2],
+                    "open": on > 0})
+    return out
 
 
 def now_minutes(now) -> float:
