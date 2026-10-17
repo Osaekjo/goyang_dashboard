@@ -33,14 +33,39 @@ st.set_page_config(page_title="가좌·송포 똑버스 도입 검토판",
                    page_icon="🚐", layout="wide")
 
 
+def _sig(p: Path) -> tuple[int, int]:
+    """파일이 바뀌면 캐시가 깨지게 하는 열쇠.
+
+    Streamlit Cloud 는 푸시하면 스크립트만 다시 읽고 @st.cache_data 는 그대로
+    둔다. 자료 파일만 바뀐 경우 새 코드가 옛 자료를 보게 되어 뜻 모를 오류가
+    난다. 크기와 수정시각을 열쇠에 넣어 그 일을 막는다.
+    """
+    s = p.stat()
+    return (s.st_size, s.st_mtime_ns)
+
+
 @st.cache_data(show_spinner=False)
+def _load(sig: tuple) -> dict:
+    d = json.loads((HERE / "data" / "scenarios.json").read_text("utf-8"))
+    if not d.get("rows") or "sel" not in d["rows"][0]:
+        raise RuntimeError(
+            "data/scenarios.json 이 옛 판이다 (승차장 선정법 구분이 없다). "
+            "build_scenarios.py 를 다시 돌리거나, 배포본이라면 앱을 "
+            "Reboot 하라.")
+    return d
+
+
 def load() -> dict:
-    return json.loads((HERE / "data" / "scenarios.json").read_text("utf-8"))
+    return _load(_sig(HERE / "data" / "scenarios.json"))
 
 
 @st.cache_data(show_spinner=False)
-def base() -> dict:
+def _base(sig: tuple) -> dict:
     return sim.load_meta()
+
+
+def base() -> dict:
+    return _base(_sig(HERE / "data" / "data.json"))
 
 
 @st.cache_resource(show_spinner="도로망을 읽는 중")
