@@ -48,15 +48,18 @@ def render(payload: dict, height: int = 520) -> None:
     """
     key = js_key()
     if not key:
-        st.info(
-            "카카오맵을 쓰려면 **JavaScript 키**가 필요합니다 (길찾기에 쓰는 "
-            "REST 키와 다릅니다).\n\n"
-            "1. https://developers.kakao.com → 내 애플리케이션 → 앱 키 → "
-            "**JavaScript 키** 복사\n"
-            "2. 같은 화면의 **플랫폼 → Web → 사이트 도메인**에 "
-            "`http://localhost:8501` 등록\n"
-            "3. `.env` 에 `KAKAO_JS_KEY=복사한키` 추가\n\n"
-            "그 전까지는 아래 「배경지도」에서 VWorld 나 Carto 를 쓰세요.",
+        st.warning(
+            "**지도를 띄울 카카오 JavaScript 키가 이 서버에 없습니다.**\n\n"
+            "키는 저장소에 올리지 않으므로(`.env` 는 `.gitignore` 대상), "
+            "배포한 곳에는 따로 넣어야 합니다.\n\n"
+            "**Streamlit Cloud 라면** — 앱 오른쪽 아래 ⋮ → *Settings* → "
+            "*Secrets* 에 아래 한 줄을 넣고 저장하면 앱이 다시 뜹니다.\n"
+            "```toml\nKAKAO_JS_KEY = \"발급받은_JavaScript_키\"\n```\n"
+            "**내 컴퓨터에서 돌린다면** — `.env` 에 "
+            "`KAKAO_JS_KEY=발급받은키` 를 추가하세요.\n\n"
+            "그리고 카카오 개발자 콘솔의 **앱 → 플랫폼 키 → JavaScript 키 → "
+            "JavaScript SDK 도메인**에 **이 사이트 주소**가 등록돼 있어야 "
+            "합니다. 등록된 주소에서만 지도가 뜹니다.",
             icon="🗝️")
         return
     html = _HTML.replace("__SDK__", SDK.format(key=key))
