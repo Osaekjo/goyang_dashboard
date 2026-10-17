@@ -61,12 +61,6 @@ def short(name: str, n: int = 11) -> str:
     return s if len(s) <= n else s[:n - 1] + "…"
 
 
-def charset(labels) -> list[str]:
-    """deck.gl TextLayer 는 기본 문자셋이 ASCII 라 한글이 빈칸으로 나온다.
-    쓰는 글자를 모두 넘겨 글자판을 만들게 한다."""
-    return sorted({c for s in labels for c in str(s)})
-
-
 def _cum(xy) -> list[float]:
     xy = np.asarray(xy, float)
     if len(xy) < 2:
@@ -386,8 +380,11 @@ def deck(live, vehs, waits, clock: float, busy) -> pdk.Deck:
             background_padding=[5, 3, 5, 3], font_weight=600,
             # pydeck 은 문자열 kwarg 를 JS 표현식으로 감싼다(@@=). 그래서 전체를
             # 한 쌍의 따옴표로 묶어야 문자열 하나로 평가된다.
+            # character_set 도 같은 이유로 글자 목록을 넘기면 안 된다 — 목록
+            # 안의 '(' 가 표현식 파서를 깬다. 'auto' 면 deck.gl 이 자료에서
+            # 쓰인 글자를 스스로 모아 글자판을 만든다(한글 포함).
             font_family="'Malgun Gothic, Apple SD Gothic Neo, sans-serif'",
-            character_set=charset(lab.lab), pickable=False))
+            character_set="'auto'", pickable=False))
 
     if live:
         L.append(pdk.Layer("PathLayer", live, get_path="path",
@@ -418,7 +415,7 @@ def deck(live, vehs, waits, clock: float, busy) -> pdk.Deck:
         L.append(pdk.Layer("TextLayer", sdf, get_position=["lon", "lat"],
                            get_text="lab", get_size=11, get_color=[255] * 3,
                            get_alignment_baseline="'center'",
-                           font_weight=700, character_set=charset(sdf.lab)))
+                           font_weight=700, character_set="'auto'"))
     if vehs:
         L.append(pdk.Layer("ScatterplotLayer", vehs,
                            get_position=["lon", "lat"], get_radius=320,
@@ -427,8 +424,7 @@ def deck(live, vehs, waits, clock: float, busy) -> pdk.Deck:
         L.append(pdk.Layer("TextLayer", vehs, get_position=["lon", "lat"],
                            get_text="lab", get_size=11, get_color=[255] * 3,
                            get_alignment_baseline="'center'",
-                           font_weight=700,
-                           character_set=charset(v["lab"] for v in vehs)))
+                           font_weight=700, character_set="'auto'"))
     return pdk.Deck(
         layers=L, map_provider="carto", map_style="light",
         initial_view_state=pdk.ViewState(
