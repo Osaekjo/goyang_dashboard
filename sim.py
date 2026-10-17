@@ -138,11 +138,16 @@ class Ride:
 
 
 def simulate(road: Road, meta: dict, veh: dict, fleet: int,
-             seed: int = 20261016, stops: list[dict] | None = None) -> dict:
-    """stops 를 주면 **지정 승차장**에서 태운다. 안 주면 문 앞에서 태운다.
+             seed: int = 20261016, stops: list[dict] | None = None,
+             km_table: dict | None = None) -> dict:
+    """지정 승차장에서 태워 의원까지 나른다.
 
-    승차장을 쓰면 같은 자리에서 출발하는 호출이 늘어 합승이 잘 되고 공차가
-    줄지만, 고령자가 승차장까지 걸어야 한다. 그 보행거리도 함께 돌려준다.
+    똑버스는 지정 승차장 운영이다. 고령자가 승차장까지 걷는 거리도 함께
+    돌려준다 — 승차장을 줄이면 탄소는 좋아지고 보행은 나빠진다.
+
+    km_table 을 주면 주행거리를 거기서 읽는다. 열쇠는 ("S", 승차장번호) 와
+    ("D", 의료기관번호) 의 쌍이다. 카카오 길찾기로 받아 둔 값을 넣는 자리이고,
+    빠진 쌍은 도로망(국가표준노드링크) 계산으로 물러선다.
     """
     rnd = np.random.default_rng(seed)
     cells = [c for c in meta["cells"] if c[4] and c[3] > 0]
@@ -166,33 +171,33 @@ def simulate(road: Road, meta: dict, veh: dict, fleet: int,
         p = dw / (1 + km) ** 6.0
         di[i] = rnd.choice(len(dest), p=p / p.sum())
 
-    # 승차 지점 — 지정 승차장이면 가장 가까운 승차장, 아니면 문 앞
+    # 승차 지점 — 가장 가까운 지정 승차장. 거기까지는 걸어간다.
+    if not stops:
+        raise ValueError("똑버스는 지정 승차장 운영이다 — stops 가 필요하다")
+    sx = np.array([s["x"] for s in stops])
+    sy = np.array([s["y"] for s in stops])
     walk = np.zeros(n_trip)
-    stop_of = np.full(n_trip, -1)
-    if stops:
-        sx = np.array([s["x"] for s in stops])
-        sy = np.array([s["y"] for s in stops])
-        for i in range(n_trip):
-            d = np.hypot(sx - ox[oi[i]], sy - oy[oi[i]])
-            stop_of[i] = int(np.argmin(d))
-            walk[i] = float(d[stop_of[i]])
-        px = sx[stop_of]
-        py = sy[stop_of]
-        o_node = np.array([stops[j]["node"] for j in stop_of])
-    else:
-        px, py = ox[oi], oy[oi]
-        o_node = road.snap(np.c_[px, py])
+    stop_of = np.zeros(n_trip, int)
+    for i in range(n_trip):
+        d = np.hypot(sx - ox[oi[i]], sy - oy[oi[i]])
+        stop_of[i] = int(np.argmin(d))
+        walk[i] = float(d[stop_of[i]])
+    px, py = sx[stop_of], sy[stop_of]
+    o_node = np.array([stops[j]["node"] for j in stop_of])
     d_node = road.snap(dest[di])
     row, dist, pred = road.solve(np.r_[o_node, d_node])
 
     legs = []
     for i in range(n_trip):
+        ks, kd = ("S", int(stop_of[i])), ("D", int(di[i]))
         legs.append({"t": t_call[i], "a": int(o_node[i]), "b": int(d_node[i]),
+                     "ka": ks, "kb": kd,
                      "ax": px[i], "ay": py[i],
                      "bx": dest[di[i], 0], "by": dest[di[i], 1], "back": 0,
                      "stop": int(stop_of[i]), "dest": int(di[i])})
         legs.append({"t": t_call[i] + CARE, "a": int(d_node[i]),
                      "b": int(o_node[i]),
+                     "ka": kd, "kb": ks,
                      "ax": dest[di[i], 0], "ay": dest[di[i], 1],
                      "bx": px[i], "by": py[i], "back": 1,
                      "stop": int(stop_of[i]), "dest": int(di[i])})
@@ -222,35 +227,45 @@ def simulate(road: Road, meta: dict, veh: dict, fleet: int,
     # 멀리 있는 차가 뽑혀 공차가 불어난다. 실제 배차는 도착시각으로 고른다.
     # 직전 하차지에서 승차지까지가 공차다.
     free = [float(T0)] * fleet
-    at: list[int | None] = [None] * fleet
+    at: list[tuple[int, tuple] | None] = [None] * fleet
     rides: list[Ride] = []
+    T = km_table or {}
+    src = 0           # 카카오에서 읽은 쌍 / 도로망으로 물러선 쌍
 
-    def dead_km(v: int, a: int) -> float:
-        if at[v] is None:
-            return 1.0
-        d = dist[row[at[v]], a] if at[v] in row else np.inf
-        return float(d) / 1000 if np.isfinite(d) else 1.5
+    def km_of(ka, kb, a: int, b: int, fallback_xy=None) -> tuple[float, bool]:
+        v = T.get((ka, kb))
+        if v is not None and np.isfinite(v):
+            return float(v), True
+        d = dist[row[a], b] if a in row else np.inf
+        if np.isfinite(d):
+            return float(d) / 1000, False
+        return (math.hypot(*fallback_xy) / 1000 * 1.4, False) \
+            if fallback_xy else (1.5, False)
 
     for grp in groups:
         g = grp[0]
         a, b = g["a"], g["b"]
-        best, best_t, best_d = 0, math.inf, 1.0
+        best, best_t, best_d, best_k = 0, math.inf, 1.0, False
         for v in range(fleet):
-            dk = dead_km(v, a)
+            if at[v] is None:
+                dk, kk = 1.0, False
+            else:
+                dk, kk = km_of(at[v][1], g["ka"], at[v][0], a)
             arr = max(g["t"], free[v]) + dk / SPEED_KMH * 60 + BOARD
             if arr < best_t:
-                best, best_t, best_d = v, arr, dk
+                best, best_t, best_d, best_k = v, arr, dk, kk
         v, km_dead, pick = best, best_d, best_t
+        src += int(best_k)
         # 공차 구간도 도로로 그린다 — 안 그리면 배차 이동 중 차가 멈춰 보인다
-        pd_ = (road.path_xy(pred[row[at[v]]], at[v], a)
-               if at[v] is not None and at[v] in row else np.empty((0, 2)))
-        km_rev = dist[row[a], b] / 1000
-        if not np.isfinite(km_rev):
-            km_rev = math.hypot(g["bx"] - g["ax"], g["by"] - g["ay"]) / 1000 * 1.4
+        pd_ = (road.path_xy(pred[row[at[v][0]]], at[v][0], a)
+               if at[v] is not None and at[v][0] in row else np.empty((0, 2)))
+        km_rev, kk = km_of(g["ka"], g["kb"], a, b,
+                           (g["bx"] - g["ax"], g["by"] - g["ay"]))
+        src += int(kk)
         depart = max(g["t"], free[v])
         drop = pick + km_rev / SPEED_KMH * 60
         free[v] = drop + BOARD
-        at[v] = b
+        at[v] = (b, g["kb"])
         rides.append(Ride(v, len(grp), g["t"], depart, pick, drop,
                           km_rev, km_dead, road.path_xy(pred[row[a]], a, b),
                           pd_, g["back"], g["stop"], g["dest"]))
@@ -260,15 +275,19 @@ def simulate(road: Road, meta: dict, veh: dict, fleet: int,
     km_dead = sum(r.km_dead for r in rides)
     wait = sum((r.pick - r.call) * r.n for r in rides) / pax
     ww = np.repeat(walk, 2)          # 구간마다 같은 보행이 한 번씩 붙는다
+    n_pair = 2 * len(rides)          # 배차마다 공차 1 + 수송 1
     return {"rides": rides, "trips": n_trip, "pax": pax, "fleet": fleet,
             "occ": pax / len(rides), "km_rev": km_rev, "km_dead": km_dead,
             "km": km_rev + km_dead, "wait": wait,
             "end": max(r.drop for r in rides), "veh": veh,
             "dead_share": km_dead / (km_rev + km_dead),
-            "stops": bool(stops),
-            "walk_med": float(np.median(ww)) if stops else 0.0,
-            "walk_max": float(ww.max()) if stops else 0.0,
-            "walk_min_med": float(np.median(ww)) / 0.8 / 60 if stops else 0.0}
+            "stops": True, "n_stops": len(stops),
+            "kakao_share": src / max(1, n_pair),
+            "walk_med": float(np.median(ww)),
+            "walk_mean": float(ww.mean()),
+            "walk_max": float(ww.max()),
+            "walk_p90": float(np.percentile(ww, 90)),
+            "walk_min_med": float(np.median(ww)) / 0.8 / 60}
 
 
 # ── 탄소 ──────────────────────────────────────────────────────────────

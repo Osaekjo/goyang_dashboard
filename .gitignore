@@ -2,3 +2,9 @@ __pycache__/
 *.pyc
 .venv/
 .DS_Store
+
+# 키가 든 파일은 절대 올리지 않는다
+.env
+
+# 카카오 응답 캐시 — 용량이 커지면 올리지 않는다 (지금은 올린다)
+# data/kakao_cache.json

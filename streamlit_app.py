@@ -1,55 +1,70 @@
 # -*- coding: utf-8 -*-
-"""가좌·송포 똑버스 운행 대시보드.
+"""가좌·송포 똑버스 도입 검토판 — 정책 판단용.
 
-시계를 **실제 현재 시각**에 묶는다. 지금이 14:23이면 화면도 14:23 상태를 보이고
-10초마다 스스로 갱신한다. 다만 가좌·송포에는 아직 똑버스가 없으므로, 이것은
-"지금 이 시각 똑버스가 돌고 있다면" 을 보여주는 **가상 운행**이다.
+운영 모니터가 아니다. **무엇을 정하면 무엇이 달라지는가**를 보여준다.
 
-지도는 인구 분포가 아니라 **경로**를 보인다. 지정 승차장에서 가까운 의원까지
-실제 도로 경로를 깔고, 그 위로 차량이 움직인다.
+  정하는 것   차종 · 도입 대수 · 지정 승차장 수
+  달라지는 것 탄소배출 · 승차장까지 보행거리 · 대기시간 · 예산
 
-숫자는 전부 sim.py 가 쥔다. 이 파일은 그린다.
+조합 3 × 12 × 13 = 468가지를 미리 돌려 data/scenarios.json 에 담아 두었다
+(build_scenarios.py). 화면은 그 표만 읽으므로 조작이 즉시 반영된다.
 """
 from __future__ import annotations
 
-import time
-from datetime import datetime, timedelta, timezone
+import json
+from pathlib import Path
 
 import altair as alt
 import numpy as np
 import pandas as pd
 import pydeck as pdk
 import streamlit as st
-from pyproj import Transformer
 
 import sim
 
-KST = timezone(timedelta(hours=9))
-TO_WGS = Transformer.from_crs(5179, 4326, always_xy=True)
+HERE = Path(__file__).resolve().parent
 C1, C2, C3, C4 = "#16707f", "#b8540f", "#6b4a9e", "#8c9499"
 
-st.set_page_config(page_title="가좌·송포 똑버스 운행 대시보드",
+st.set_page_config(page_title="가좌·송포 똑버스 도입 검토판",
                    page_icon="🚐", layout="wide")
 
 
-# ── 자료 ──────────────────────────────────────────────────────────────
-@st.cache_resource(show_spinner="도로망을 읽는 중")
-def get_road() -> sim.Road:
-    return sim.Road()
+@st.cache_data(show_spinner=False)
+def load() -> dict:
+    return json.loads((HERE / "data" / "scenarios.json").read_text("utf-8"))
 
 
 @st.cache_data(show_spinner=False)
-def get_meta() -> dict:
+def meta() -> dict:
     return sim.load_meta()
 
 
-def rdp(xy: np.ndarray, tol: float = 8.0) -> np.ndarray:
-    """경로 꼭짓점 솎기(Ramer–Douglas–Peucker). 재생은 0.35초마다 지도를 통째로
-    다시 보내므로, 눈에 안 보이는 꼭짓점을 줄여야 전송량이 감당된다.
-    tol 은 미터 — 8 m 면 화면에서 차이가 나지 않는다."""
+@st.cache_resource(show_spinner="도로망을 읽는 중")
+def road() -> sim.Road:
+    return sim.Road()
+
+
+@st.cache_data(show_spinner="경로를 그리는 중", max_entries=16)
+def routes(k: int) -> list[dict]:
+    """승차장에서 가까운 의원 3곳까지의 경로 — 지도에만 쓴다."""
+    from pyproj import Transformer
+    T = Transformer.from_crs(5179, 4326, always_xy=True)
+    R = sim.stop_routes(road(), sim.designated_stops(road(), meta(), k),
+                        meta(), 3)
+    out = []
+    for r in R:
+        xy = np.asarray(r.pop("path"), float)
+        if len(xy) > 2:
+            xy = _thin(xy)
+        lon, lat = T.transform(xy[:, 0], xy[:, 1])
+        r["path"] = [[round(a, 6), round(b, 6)] for a, b in zip(lon, lat)]
+        out.append(r)
+    return out
+
+
+def _thin(xy: np.ndarray, tol: float = 12.0) -> np.ndarray:
+    """경로 꼭짓점 솎기 — 12 m 면 화면에서 차이가 나지 않는다."""
     n = len(xy)
-    if n < 3:
-        return xy
     keep = np.zeros(n, bool)
     keep[0] = keep[-1] = True
     stack = [(0, n - 1)]
@@ -59,638 +74,342 @@ def rdp(xy: np.ndarray, tol: float = 8.0) -> np.ndarray:
             continue
         a, b = xy[i], xy[j]
         ab = b - a
-        L = np.hypot(*ab)
+        L = float(np.hypot(*ab))
         seg = xy[i + 1:j]
-        if L < 1e-9:
-            d = np.hypot(seg[:, 0] - a[0], seg[:, 1] - a[1])
-        else:
-            d = np.abs(ab[0] * (a[1] - seg[:, 1])
-                       - ab[1] * (a[0] - seg[:, 0])) / L
-        k = int(np.argmax(d))
-        if d[k] > tol:
-            m = i + 1 + k
-            keep[m] = True
-            stack += [(i, m), (m, j)]
+        d = (np.hypot(seg[:, 0] - a[0], seg[:, 1] - a[1]) if L < 1e-9 else
+             np.abs(ab[0] * (a[1] - seg[:, 1])
+                    - ab[1] * (a[0] - seg[:, 0])) / L)
+        m = int(np.argmax(d))
+        if d[m] > tol:
+            keep[i + 1 + m] = True
+            stack += [(i, i + 1 + m), (i + 1 + m, j)]
     return xy[keep]
 
 
-def ll(xy, tol: float = 8.0) -> list[list[float]]:
-    xy = np.asarray(xy, float)
-    if len(xy) == 0:
-        return []
-    if tol and len(xy) > 2:
-        xy = rdp(xy, tol)
-    lon, lat = TO_WGS.transform(xy[:, 0], xy[:, 1])
-    return [[round(a, 6), round(b, 6)] for a, b in zip(lon, lat)]
+D = load()
+M = meta()["meta"]
+ROWS = pd.DataFrame(D["rows"])
+VEH = D["vehicles"]
 
+# ── 현행(기준선) ──────────────────────────────────────────────────────
+# 가좌·송포에는 갈 수 있는 대중교통이 없다. 지금 이 통행은 택시나 자가용으로
+# 이뤄지고 있고, 그 배출이 비교 기준이다. 무엇으로 보느냐에 따라 결론이 갈려
+# 고르게 해 둔다.
+BASELINE = {
+    "택시 단독": ("승용 중형 LPG · 1인 탑승", sim.EF_TAXI, 1.0),
+    "택시 2인 합승": ("승용 중형 LPG · 2인 분담", sim.EF_TAXI, 2.0),
+    "자가용 단독": ("승용 소형 휘발유 · 1인 탑승", sim.EF_CAR, 1.0),
+    "자가용 2인": ("승용 소형 휘발유 · 보호자 동반", sim.EF_CAR, 2.0),
+}
 
-def one(x: float, y: float) -> list[float]:
-    a, b = TO_WGS.transform(x, y)
-    return [round(a, 6), round(b, 6)]
-
-
-def hm(m: float) -> str:
-    return f"{int(m // 60):02d}:{int(m % 60):02d}"
-
-
-def short(name: str, n: int = 11) -> str:
-    """지도 라벨용으로 기관명을 줄인다. 꼬리의 '의원·병원'은 떼지 않는다."""
-    s = str(name).strip()
-    return s if len(s) <= n else s[:n - 1] + "…"
-
-
-def _cum(xy) -> list[float]:
-    xy = np.asarray(xy, float)
-    if len(xy) < 2:
-        return [0.0]
-    d = np.r_[0, np.cumsum(np.hypot(np.diff(xy[:, 0]), np.diff(xy[:, 1])))]
-    return (d / d[-1]).tolist() if d[-1] > 0 else [0.0] * len(xy)
-
-
-@st.cache_data(show_spinner="승차장을 고르는 중", max_entries=12)
-def get_stops(k: int) -> list[dict]:
-    S = sim.designated_stops(get_road(), get_meta(), k)
-    for s in S:
-        s["ll"] = one(s["x"], s["y"])
-    return S
-
-
-@st.cache_data(show_spinner="경로를 찾는 중", max_entries=12)
-def get_stop_routes(k: int, per: int) -> list[dict]:
-    R = sim.stop_routes(get_road(), get_stops(k), get_meta(), per)
-    for r in R:
-        r["ll"] = ll(r.pop("path"))
-    return R
-
-
-@st.cache_data(show_spinner="운행을 계산하는 중", max_entries=60)
-def run(vi: int, fleet: int, k: int | None) -> dict:
-    """차량·대수·승차방식별 하루 운행. 시드가 고정이라 결과가 늘 같다."""
-    s = sim.simulate(get_road(), get_meta(), sim.VEHICLES[vi], fleet,
-                     stops=get_stops(k) if k else None)
-    out = {kk: v for kk, v in s.items() if kk != "rides"}
-    out["rides"] = [{
-        "v": r.v, "n": r.n, "call": r.call, "depart": r.depart,
-        "pick": r.pick, "drop": r.drop, "km_rev": r.km_rev,
-        "km_dead": r.km_dead, "back": r.back, "stop": r.stop, "dest": r.dest,
-        # 좌표를 먼저 솎고 거기서 누적길이를 뽑는다. 원본으로 누적을 재면
-        # 차량이 솎인 선 위 엉뚱한 자리에 찍힌다.
-        **dict(zip(("ll", "cum"), poly(r.path))),
-        **dict(zip(("dll", "dcum"), poly(r.path_dead))),
-    } for r in s["rides"]]
-    return out
-
-
-def poly(xy) -> tuple[list, list]:
-    xy = np.asarray(xy, float)
-    if len(xy) > 2:
-        xy = rdp(xy)
-    return ll(xy, tol=0), _cum(xy)
-
-
-def at_frac(path: list, cum: list[float], f: float) -> list[float]:
-    if not path:
-        return [0.0, 0.0]
-    i = max(1, min(int(np.searchsorted(cum, f)), len(path) - 1))
-    a, b = path[i - 1], path[i]
-    span = cum[i] - cum[i - 1]
-    t = 0.0 if span <= 0 else (f - cum[i - 1]) / span
-    return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]
-
-
-META = get_meta()
-M = META["meta"]
-
-# ── 조작 ──────────────────────────────────────────────────────────────
 st.markdown(
     "<div style='display:flex;gap:12px;align-items:baseline;flex-wrap:wrap'>"
-    "<h2 style='margin:0;font-size:1.35rem'>가좌·송포 똑버스 운행 대시보드</h2>"
-    "<span style='font-family:monospace;font-size:.68rem;letter-spacing:.08em;"
+    "<h2 style='margin:0;font-size:1.4rem'>가좌·송포 똑버스 도입 검토판</h2>"
+    "<span style='color:#6b7a81;font-size:.88rem'>차종 · 대수 · 승차장 수를"
+    " 정하면 탄소와 보행거리가 어떻게 달라지는가</span>"
+    "<span style='font-family:monospace;font-size:.66rem;letter-spacing:.07em;"
     "background:#fdf3e4;color:#7a4a09;border:1px dashed #dfb87e;"
-    "border-radius:3px;padding:3px 8px;font-weight:600'>"
-    "시뮬레이션 · 실제 운행 데이터 아님</span></div>", unsafe_allow_html=True)
+    "border-radius:3px;padding:3px 8px;font-weight:600'>수요·운행은 추정치"
+    "</span></div>", unsafe_allow_html=True)
 
-c = st.columns([2, 1.1, 1.5, 1.1, 1.5, 1.2])
-vi = c[0].selectbox("차량", range(len(sim.VEHICLES)),
-                    format_func=lambda i: sim.VEHICLES[i]["name"], index=1)
+c = st.columns([2.2, 1.5, 1.5, 1.9])
+vi = c[0].selectbox("차종", range(len(VEH)),
+                    format_func=lambda i: VEH[i]["name"], index=1)
 fleet = c[1].slider("도입 대수", 1, 12, 7)
-board_mode = c[2].radio("승차 방식", ["지정 승차장", "문 앞 호출"],
-                        horizontal=True)
-K = c[3].slider("승차장 수", 4, 16, 10,
-                disabled=(board_mode == "문 앞 호출"))
-mode = c[4].radio("시각", ["재생", "지금", "직접"], horizontal=True)
-
-SIM = run(vi, fleet, K if board_mode == "지정 승차장" else None)
-END = max(sim.T1, SIM["end"])
-if mode == "재생":
-    SPEED = c[5].select_slider("재생 속도", [1, 2, 4, 8, 16], value=4,
-                               format_func=lambda v: f"{v}분/초")
-    manual = None
-elif mode == "직접":
-    SPEED = 0
-    manual = c[5].slider("운행 시각", sim.T0, int(END), int(sim.T0 + 180))
-else:
-    SPEED, manual = 0, None
-    c[5].caption("실제 시각을 따라간다 (10초마다 갱신)")
-
-if "clock" not in st.session_state:
-    st.session_state.clock = float(sim.T0)
-if "tick" not in st.session_state:
-    st.session_state.tick = None
-
-STOPS = get_stops(K) if board_mode == "지정 승차장" else []
-SROUTES = get_stop_routes(K, 3) if board_mode == "지정 승차장" else []
+K = c[2].slider("지정 승차장 수", 4, 16, 10)
+bl = c[3].selectbox("현행(비교 기준)", list(BASELINE), index=0,
+                    help="가좌·송포에는 갈 수 있는 대중교통이 없다. "
+                         "지금 이 통행이 무엇으로 이뤄지고 있다고 보느냐다.")
+BL_NOTE, BL_EF, BL_OCC = BASELINE[bl]
 
 
-@st.fragment(run_every=0.35 if mode == "재생"
-             else 10 if mode == "지금" else None)
-def board() -> None:
-    now = datetime.now(KST)
-    if mode == "재생":
-        # 실제로 흐른 시간만큼 운행 시각을 밀어 차량이 이어서 움직이게 한다.
-        # 하루가 끝나면 처음으로 돌아가 계속 돈다.
-        mono = time.monotonic()
-        last = st.session_state.tick
-        st.session_state.tick = mono
-        dt = 0.0 if last is None else min(2.0, mono - last)
-        ck = st.session_state.clock + dt * SPEED
-        if ck >= END:
-            ck = float(sim.T0)
-        st.session_state.clock = ck
-        clock, phase = ck, f"재생 중 · {SPEED}분/초"
-    elif mode == "지금":
-        raw = now.hour * 60 + now.minute + now.second / 60
-        clock = min(max(raw, sim.T0), END)
-        phase = ("운행 시작 전 — 오늘 08:30 개시" if raw < sim.T0
-                 else "오늘 운행 종료" if raw > END else "운행 중")
-    else:
-        clock, phase = float(manual), "직접 고른 시각"
-    draw(clock, phase, now)
+def cut_year(df: pd.DataFrame) -> pd.Series:
+    """고른 기준선으로 다시 잰 연간 탄소 증감 (톤). 양수면 감축."""
+    base = df["km_rev"] * BL_EF / BL_OCC / 1000
+    return (base - df["co2"]) * 365 / 1000
 
 
-def draw(clock: float, phase: str, now: datetime) -> None:
-    pax = kmR = kmD = 0.0
-    moving = onboard = 0
-    per = [{"pax": 0, "km": 0.0, "st": "대기", "pos": None, "next": None}
-           for _ in range(fleet)]
-    vehs, idle_pts, waits_pt, live, dead_live, waits = [], [], [], [], [], []
-    busy_dest: dict[int, int] = {}
-    for r in SIM["rides"]:
-        P = per[r["v"]]
-        if clock >= r["drop"]:                       # 끝난 배차
-            pax += r["n"]; kmR += r["km_rev"]; kmD += r["km_dead"]
-            P["pax"] += r["n"]; P["km"] += r["km_rev"] + r["km_dead"]
-            if r["ll"]:
-                P["pos"] = r["ll"][-1]               # 마지막 하차지에 서 있다
-        elif clock >= r["pick"]:                     # 승객 수송 중
-            f = (clock - r["pick"]) / max(.01, r["drop"] - r["pick"])
-            onboard += r["n"]; moving += 1
-            kmR += r["km_rev"] * f; kmD += r["km_dead"]
-            P["km"] += r["km_rev"] * f + r["km_dead"]
-            P["st"] = f"승객 {r['n']}명 수송"
-            p = at_frac(r["ll"], r["cum"], f)
-            P["pos"] = p
-            vehs.append({"lon": p[0], "lat": p[1], "n": r["n"],
-                         "v": r["v"] + 1, "lab": str(r["n"])})
-            live.append({"path": r["ll"]})
-        elif clock >= r["depart"]:                   # 공차로 태우러 가는 중
-            f = min(1, (clock - r["depart"])
-                    / max(.01, r["pick"] - r["depart"]))
-            moving += 1
-            kmD += r["km_dead"] * f
-            P["km"] += r["km_dead"] * f
-            P["st"] = "배차 이동 (공차)"
-            if r["dll"]:
-                p = at_frac(r["dll"], r["dcum"], f)
-                P["pos"] = p
-                vehs.append({"lon": p[0], "lat": p[1], "n": 0,
-                             "v": r["v"] + 1, "lab": "→"})
-                dead_live.append({"path": r["dll"]})
-        elif P["next"] is None or r["depart"] < P["next"]:
-            P["next"] = r["depart"]                  # 다음 배차까지 쉰다
-        if r["call"] <= clock < r["pick"]:
-            waits.append(clock - r["call"])
-            if r["ll"]:
-                waits_pt.append({"lon": r["ll"][0][0], "lat": r["ll"][0][1]})
-        if r["call"] <= clock < r["drop"]:
-            busy_dest[r["dest"]] = busy_dest.get(r["dest"], 0) + r["n"]
+ROWS = ROWS.assign(cut_y=cut_year(ROWS))
+cur = ROWS[(ROWS.vi == vi) & (ROWS.fleet == fleet) & (ROWS.k == K)].iloc[0]
 
-    # 쉬는 차량도 어디 있는지 보인다 — "대기"만 떠 있으면 읽히지 않는다
-    for i, P in enumerate(per):
-        if P["st"] != "대기":
-            continue
-        P["st"] = ("다음 배차 " + hm(P["next"])) if P["next"] is not None \
-            else ("운행 종료" if clock > SIM["end"] else "대기")
-        if P["pos"]:
-            idle_pts.append({"lon": P["pos"][0], "lat": P["pos"][1],
-                             "v": i + 1, "lab": str(i + 1),
-                             "tip": P["st"]})
+# ── 핵심 수치 ─────────────────────────────────────────────────────────
+k = st.columns(5)
+flat = abs(cur.cut_y) < 0.05          # 반올림하면 0 인 구간은 '비긴다'로 적는다
+k[0].metric("연간 탄소",
+            "± 0.0 t" if flat else
+            f"{'▲ +' if cur.cut_y >= 0 else '▼ −'}{abs(cur.cut_y):,.1f} t",
+            ("현행과 비긴다" if flat else
+             f"{'감축' if cur.cut_y >= 0 else '증가'}") + f" · 현행 {bl} 대비",
+            delta_color="off" if flat
+            else "normal" if cur.cut_y >= 0 else "inverse")
+k[1].metric("승차장까지 보행", f"{cur.walk_med:,.0f} m",
+            f"0.8 m/s 로 {cur.walk_min:.1f}분 · 10명 중 1명은 "
+            f"{cur.walk_p90:,.0f} m 이상", delta_color="off")
+k[2].metric("평균 대기", f"{cur.wait:,.0f}분",
+            f"10번 중 1번은 {cur.wait_p90:,.0f}분 이상"
+            + ("" if cur.in_hours else " · 운행시간 초과"),
+            delta_color="off")
+k[3].metric("연간 운영비", f"{cur.cost_year / 1e8:,.1f}억원",
+            f"고령 1인당 {cur.cost_year / M['고령']:,.0f}원/년",
+            delta_color="off")
+k[4].metric("평균 재차인원", f"{cur.occ:.2f}명",
+            f"손익분기 {cur.breakeven_dead:.2f}명 (공차 포함)",
+            delta_color="off")
 
-    ef = sim.VEHICLES[vi]["ef"]
-    km, co2 = kmR + kmD, (kmR + kmD) * ef / 1000
-    base = kmR * sim.EF_TAXI / 2 / 1000
-    cut = base - co2
+if not cur.in_hours:
+    st.warning(
+        f"**{fleet}대로는 하루 78통행을 운행시간(08:30–17:00) 안에 처리하지"
+        f" 못한다.** 마지막 하차가 {int(cur.end // 60):02d}:"
+        f"{int(cur.end % 60):02d}이고 평균 대기가 {cur.wait:,.0f}분이다.",
+        icon="⚠️")
 
-    st.markdown(
-        f"<div style='font-family:monospace;font-size:1.5rem;font-weight:600'>"
-        f"<span style='color:{C1}'>●</span> {hm(clock)}"
-        f"<span style='font-size:.5em;font-weight:400;color:#777;"
-        f"margin-left:10px'>{phase} · 실제 시각 {now:%Y-%m-%d %H:%M:%S} KST"
-        f"</span></div>", unsafe_allow_html=True)
-
-    k = st.columns(6)
-    k[0].metric("누적 탑승 (연인원)", f"{pax:,.0f}명",
-                f"하루 {SIM['trips']}통행 × 2구간 = {SIM['pax']}명 중 "
-                f"{100 * pax / SIM['pax']:.0f}%", delta_color="off")
-    k[1].metric("운행 중 차량", f"{moving}/{fleet}대",
-                f"탑승 {onboard}명 · 대기 호출 {len(waits)}건",
-                delta_color="off")
-    k[2].metric("누적 주행거리", f"{km:,.0f} km",
-                f"수송 {kmR:,.0f} + 공차 {kmD:,.0f}"
-                f" ({100 * kmD / max(1, km):.0f}%)", delta_color="off")
-    k[3].metric("누적 탄소배출", f"{co2:,.1f} kg",
-                f"현행 택시 2인 {base:,.1f} kg", delta_color="off")
-    k[4].metric("현행 대비",
-                f"{'▲ +' if cut >= 0 else '▼ −'}{abs(cut):,.1f} kg",
-                f"연 {'+' if cut >= 0 else '−'}{abs(cut) * 365 / 1000:,.1f} t",
-                delta_color="normal" if cut >= 0 else "inverse")
-    if SIM["stops"]:
-        k[5].metric("승차장까지 보행", f"{SIM['walk_med']:,.0f} m",
-                    f"0.8 m/s 로 {SIM['walk_min_med']:.1f}분 · "
-                    f"최대 {SIM['walk_max']:,.0f} m", delta_color="off")
-    else:
-        k[5].metric("승차장까지 보행", "0 m", "문 앞에서 탄다",
-                    delta_color="off")
-
-    left, right = st.columns([2.05, 1])
-    with left:
-        st.pydeck_chart(
-            deck(live, dead_live, vehs, idle_pts, waits_pt, clock, busy_dest),
-            width="stretch")
-        st.caption(
-            "옅은 청록 선 = 지정 승차장에서 가까운 의원 3곳까지의 **실제 도로"
-            " 경로**(국가표준노드링크 2025-05-12) · 굵은 주황 = 지금 승객을"
-            " 태우고 달리는 구간 · 회색 선 = 공차로 태우러 가는 구간 · "
-            "청록 큰 점 = 지정 승차장(크기는 맡은 고령인구) · "
-            "보라 = 의원(크기는 의사 수, 붉을수록 혼잡) · "
-            "진보라 점 = 운행 중 차량(숫자는 탑승, → 는 공차) · "
-            "회색 점 = 쉬는 차량(번호는 차량)")
-    with right:
-        st.markdown("**의원 실시간 현황** &nbsp;"
-                    "<span style='font-family:monospace;font-size:.62rem;"
-                    "background:#fdf3e4;color:#7a4a09;border:1px dashed "
-                    "#dfb87e;border-radius:3px;padding:2px 6px'>가상 자료"
-                    "</span>", unsafe_allow_html=True)
-        st.dataframe(clinic_table(clock, busy_dest), hide_index=True,
-                     width="stretch", height=232)
-        st.caption(
-            "심평원은 기관별 **인력 현황**은 공개하지만 실시간 진료 인원·대기"
-            " 환자를 주는 공개 API 는 없다. 위 값은 그런 API 가 있다고 치고"
-            " 만든 것이다 — 총의사수만 실제 자료다.")
-        st.markdown("**차량 현황**")
-        st.dataframe(pd.DataFrame([{
-            "차량": f"{sim.VEHICLES[vi]['id']}-{i + 1:02d}", "상태": p["st"],
-            "탑승": p["pax"], "주행 km": round(p["km"])}
-            for i, p in enumerate(per)]), hide_index=True, width="stretch",
-            height=min(250, 36 * fleet + 38))
-
-    a, b, cc = st.columns(3)
-    with a:
-        st.markdown("**승차장별 수요와 보행거리**")
-        st.altair_chart(chart_stops(), width="stretch")
-    with b:
-        st.markdown("**탄소 수지** — 현행 택시 2인 합승 대비")
-        st.altair_chart(chart_co2(clock, ef), width="stretch")
-    with cc:
-        st.markdown("**시간대별 탑승**")
-        st.altair_chart(chart_hourly(clock), width="stretch")
+# ── 트레이드오프 ──────────────────────────────────────────────────────
+st.markdown("### 무엇을 정하면 무엇이 달라지는가")
+t1, t2, t3 = st.columns(3)
 
 
-# ── 의원 현황 ─────────────────────────────────────────────────────────
-def focus_dests() -> tuple[list[int], dict[int, float]]:
-    """화면에 이름을 띄울 의원 — 승차장이 닿는 곳, 없으면 수요가 많은 곳."""
-    if SROUTES:
-        idx, seen = [], set()
-        for r in sorted(SROUTES, key=lambda r: (r["rank"], r["km"])):
-            if r["dest"] not in seen:
-                seen.add(r["dest"])
-                idx.append(r["dest"])
-        near = {j: min(x["km"] for x in SROUTES if x["dest"] == j)
-                for j in idx}
-        return idx, near
-    cnt: dict[int, int] = {}
-    for r in SIM["rides"]:
-        cnt[r["dest"]] = cnt.get(r["dest"], 0) + r["n"]
-    idx = sorted(cnt, key=lambda j: -cnt[j])[:14]
-    return idx, {j: 0.0 for j in idx}
+def dual(df, x, xt, left, lt, lc, right, rt, rc, mark):
+    """왼쪽 축 하나, 오른쪽 축 하나. 고른 값에 세로선을 긋는다."""
+    base = alt.Chart(df)
+    a = base.mark_line(color=lc, point=True, strokeWidth=2.4).encode(
+        x=alt.X(f"{x}:Q", title=xt, axis=alt.Axis(tickMinStep=1)),
+        y=alt.Y(f"{left}:Q", title=lt, axis=alt.Axis(titleColor=lc)),
+        tooltip=[x, left, right])
+    b = base.mark_line(color=rc, point=True, strokeWidth=2.4,
+                       strokeDash=[5, 3]).encode(
+        x=alt.X(f"{x}:Q"),
+        y=alt.Y(f"{right}:Q", title=rt, axis=alt.Axis(titleColor=rc)))
+    rule = alt.Chart(pd.DataFrame({x: [mark]})).mark_rule(
+        color="#555", strokeWidth=1.4, strokeDash=[2, 2]).encode(x=f"{x}:Q")
+    return alt.layer(a, b, rule).resolve_scale(y="independent").properties(
+        height=236)
 
 
-def clinic_table(clock: float, busy: dict[int, int]) -> pd.DataFrame:
-    idx, near = focus_dests()
-    rows = []
-    for s in sim.clinic_status(META, idx[:14], clock):
-        rows.append({
-            "의원": s["name"][:14], "종별": s["kind"],
-            "거리 km": round(near.get(s["dest"], 0), 1) or None,
-            "의사": f"{s['on']}/{s['staff']}",
-            "대기": s["waiting"],
-            "예상 대기": "휴진" if not s["open"] else f"{s['wait_min']}분",
-            "이동 중": busy.get(s["dest"], 0) or None,
-        })
-    return pd.DataFrame(rows)
+with t1:
+    st.markdown(f"**승차장 수** — 보행과 탄소는 반대로 움직인다"
+                f" &nbsp;<span style='color:#8699a1;font-size:.8rem'>"
+                f"{VEH[vi]['name'].split()[0]} · {fleet}대</span>",
+                unsafe_allow_html=True)
+    d = ROWS[(ROWS.vi == vi) & (ROWS.fleet == fleet)].sort_values("k")
+    d = d.rename(columns={"walk_med": "보행 중앙(m)", "cut_y": "연간 탄소(t)"})
+    st.altair_chart(dual(d, "k", "지정 승차장 수",
+                         "보행 중앙(m)", "보행 중앙 (m)", C1,
+                         "연간 탄소(t)", "연간 탄소 (t)", C2, K),
+                    width="stretch")
+    lo, hi = d["보행 중앙(m)"].max(), d["보행 중앙(m)"].min()
+    st.caption(
+        f"승차장을 {d.k.min()}곳에서 {d.k.max()}곳으로 늘리면 보행 중앙이"
+        f" {lo:,.0f} → {hi:,.0f} m 로 줄지만, 차가 더 많이 돌아 탄소는"
+        f" {d['연간 탄소(t)'].iloc[0]:+.1f} → {d['연간 탄소(t)'].iloc[-1]:+.1f} t"
+        f" 로 나빠진다.")
 
+with t2:
+    st.markdown(f"**도입 대수** — 대기와 예산은 반대로 움직인다"
+                f" &nbsp;<span style='color:#8699a1;font-size:.8rem'>"
+                f"{VEH[vi]['name'].split()[0]} · 승차장 {K}곳</span>",
+                unsafe_allow_html=True)
+    d = ROWS[(ROWS.vi == vi) & (ROWS.k == K)].sort_values("fleet").copy()
+    d["연간 비용(억)"] = d.cost_year / 1e8
+    d = d.rename(columns={"wait": "평균 대기(분)"})
+    st.altair_chart(dual(d, "fleet", "도입 대수",
+                         "평균 대기(분)", "평균 대기 (분)", C1,
+                         "연간 비용(억)", "연간 비용 (억원)", C3, fleet),
+                    width="stretch")
+    need = d[d.in_hours].fleet.min() if d.in_hours.any() else None
+    st.caption(
+        f"운행시간 안에 하루 78통행을 처리하려면 **최소 {need}대**가 필요하다."
+        if need else "어떤 대수로도 운행시간 안에 다 처리하지 못한다.")
+
+with t3:
+    st.markdown("**차종** — 같은 조건에서 배출만 바꿔 본다"
+                f" &nbsp;<span style='color:#8699a1;font-size:.8rem'>"
+                f"{fleet}대 · 승차장 {K}곳</span>", unsafe_allow_html=True)
+    d = ROWS[(ROWS.fleet == fleet) & (ROWS.k == K)].copy()
+    d["차종"] = [VEH[i]["name"] for i in d.vi]
+    bar = alt.Chart(d).mark_bar(cornerRadius=3).encode(
+        y=alt.Y("차종:N", sort=None, title=None,
+                axis=alt.Axis(labelLimit=180)),
+        x=alt.X("cut_y:Q", title="연간 탄소 (t) — 오른쪽이 좋다"),
+        color=alt.condition(alt.datum.cut_y >= 0, alt.value(C1), alt.value(C2)),
+        tooltip=["차종", "cut_y", "breakeven_dead", "occ"])
+    lab = alt.Chart(d).mark_text(align="left", dx=5, fontSize=11,
+                                 fontWeight=600).encode(
+        y=alt.Y("차종:N", sort=None), x="cut_y:Q",
+        text=alt.Text("cut_y:Q", format="+.1f"),
+        color=alt.condition(alt.datum.cut_y >= 0, alt.value(C1), alt.value(C2)))
+    zero = alt.Chart(pd.DataFrame({"x": [0]})).mark_rule(
+        color="#555", strokeWidth=1.4).encode(x="x:Q")
+    st.altair_chart((bar + zero + lab).properties(height=236),
+                    width="stretch")
+    best = d.loc[d.cut_y.idxmax()]
+    st.caption(
+        f"**{best['차종']}** 가 가장 낫다. 손익분기 재차인원"
+        f" {best.breakeven_dead:.2f}명(공차 포함)인데 실제 재차는"
+        f" {best.occ:.2f}명이다.")
 
 # ── 지도 ──────────────────────────────────────────────────────────────
-@st.cache_data(show_spinner=False)
-def base_layers() -> dict:
-    dl, dt = TO_WGS.transform([d[0] for d in META["dest"]],
-                              [d[1] for d in META["dest"]])
-    dest = pd.DataFrame({
-        "lon": dl, "lat": dt,
-        "name": [d[5] for d in META["dest"]],
-        "kind": [d[6] for d in META["dest"]],
-        "doctors": [max(1, d[7]) for d in META["dest"]]})
+st.markdown("### 지정 승차장과 의원까지의 경로")
+mcol, scol = st.columns([2.05, 1])
+S = D["stops"][str(K)]
+RT = routes(K)
+
+
+def deck_map() -> pdk.Deck:
+    me = meta()
+    dest = me["dest"]
+    from pyproj import Transformer
+    T = Transformer.from_crs(5179, 4326, always_xy=True)
+    dl, dt = T.transform([d[0] for d in dest], [d[1] for d in dest])
+    cl = pd.DataFrame({"lon": dl, "lat": dt,
+                       "name": [d[5] for d in dest],
+                       "kind": [d[6] for d in dest],
+                       "doctors": [max(1, d[7]) for d in dest]})
     dong = []
-    for d in META["dong"]:
+    for d in me["dong"]:
         for ring in d["rings"]:
-            a, b = TO_WGS.transform([p[0] for p in ring], [p[1] for p in ring])
+            a, b = T.transform([p[0] for p in ring], [p[1] for p in ring])
             dong.append({"polygon": [[round(p, 6), round(q, 6)]
                                      for p, q in zip(a, b)]})
-    gz = [c for c in META["cells"] if c[4]]
-    lon, lat = TO_WGS.transform([c[0] + 125 for c in gz],
-                                [c[1] + 125 for c in gz])
-    return {"dest": dest, "dong": dong,
-            "view": (float(np.mean(lon)), float(np.mean(lat)))}
-
-
-def deck(live, dead, vehs, idle, waits, clock: float, busy) -> pdk.Deck:
-    B = base_layers()
-    L = [pdk.Layer("PolygonLayer", B["dong"], get_polygon="polygon",
-                   stroked=True, filled=False,
-                   get_line_color=[184, 84, 15, 130],
-                   line_width_min_pixels=2)]
-
-    # 승차장 → 의원 경로. 가장 가까운 한 곳은 진하게, 나머지는 옅게.
-    if SROUTES:
-        L.append(pdk.Layer(
-            "PathLayer",
-            [{"path": r["ll"], "w": 14 if r["rank"] == 0 else 7,
-              "c": [22, 112, 127, 150] if r["rank"] == 0
-                   else [22, 112, 127, 55],
-              "name": f"{r['stop_name']} → {r['name']}",
-              "tip": f"{r['km']:.1f} km · {r['min']:.0f}분"}
-             for r in SROUTES],
-            get_path="path", get_color="c", get_width="w",
-            width_min_pixels=1, pickable=True,
-            cap_rounded=True, joint_rounded=True))
-
-    # 의원 — 크기는 의사 수, 색은 가상 혼잡도
-    st_now = {s["dest"]: s for s in sim.clinic_status(
-        META, list(range(len(META["dest"]))), clock)}
-    d = B["dest"].copy()
-    d["on"] = [st_now[i]["on"] for i in range(len(d))]
-    d["waiting"] = [st_now[i]["waiting"] for i in range(len(d))]
-    d["wait_min"] = [st_now[i]["wait_min"] for i in range(len(d))]
-    d["col"] = [
-        [150, 155, 160, 70] if r.on == 0 else
-        [184, 84, 15, 215] if r.wait_min >= 30 else
-        [196, 140, 60, 200] if r.wait_min >= 15 else
-        [107, 74, 158, 190] for r in d.itertuples()]
-    L.append(pdk.Layer("ScatterplotLayer", d, get_position=["lon", "lat"],
-                       get_radius="60 + doctors * 22", radius_min_pixels=3,
-                       radius_max_pixels=22, get_fill_color="col",
-                       pickable=True, stroked=False))
-
-    # 의원 이름과 현재 대기 — 지도 위에 직접. 이름은 실제, 대기는 가상이다.
-    idx, _ = focus_dests()
+    sdf = pd.DataFrame(S)
+    sdf["tip"] = [f"고령 {r['pop']:.0f}명 · 보행 중앙 {r['walk_med']} m "
+                  f"(최대 {r['walk_max']} m)" for r in S]
+    sdf["lab"] = [r["name"].split()[-1] for r in S]
+    used = sorted({r["dest"] for r in RT})
     lab = pd.DataFrame([{
-        "lon": float(d.lon.iloc[j]), "lat": float(d.lat.iloc[j]),
-        "lab": f"{short(d['name'].iloc[j])}  "
-               + ("휴진" if st_now[j]["on"] == 0
-                  else f"대기 {st_now[j]['waiting']}명"),
-        "col": [120, 128, 134] if st_now[j]["on"] == 0 else
-               [150, 62, 8] if st_now[j]["wait_min"] >= 30 else
-               [40, 52, 60]} for j in idx])
-    if len(lab):
-        L.append(pdk.Layer(
-            "TextLayer", lab, get_position=["lon", "lat"], get_text="lab",
-            get_color="col", get_size=12,
-            get_text_anchor="'start'", get_alignment_baseline="'center'",
-            get_pixel_offset=[13, 0], background=True,
-            get_background_color=[255, 255, 255, 226],
-            background_padding=[5, 3, 5, 3], font_weight=600,
-            # pydeck 은 문자열 kwarg 를 JS 표현식으로 감싼다(@@=). 그래서 전체를
-            # 한 쌍의 따옴표로 묶어야 문자열 하나로 평가된다.
-            # character_set 도 같은 이유로 글자 목록을 넘기면 안 된다 — 목록
-            # 안의 '(' 가 표현식 파서를 깬다. 'auto' 면 deck.gl 이 자료에서
-            # 쓰인 글자를 스스로 모아 글자판을 만든다(한글 포함).
-            font_family="'Malgun Gothic, Apple SD Gothic Neo, sans-serif'",
-            character_set="'auto'", pickable=False))
-
-    if dead:
-        L.append(pdk.Layer("PathLayer", dead, get_path="path",
-                           get_color=[140, 148, 153, 160], get_width=14,
-                           width_min_pixels=2, cap_rounded=True,
-                           joint_rounded=True))
-    if live:
-        L.append(pdk.Layer("PathLayer", live, get_path="path",
-                           get_color=[184, 84, 15, 225], get_width=28,
-                           width_min_pixels=3, cap_rounded=True,
-                           joint_rounded=True))
-    if waits:
-        L.append(pdk.Layer("ScatterplotLayer", waits,
-                           get_position=["lon", "lat"], get_radius=300,
-                           radius_min_pixels=6, radius_max_pixels=18,
-                           stroked=True, filled=False,
-                           get_line_color=[22, 112, 127, 235],
-                           line_width_min_pixels=2))
-    if STOPS:
-        sdf = pd.DataFrame([{
-            "lon": s["ll"][0], "lat": s["ll"][1], "name": s["name"],
-            "pop": s["pop"], "walk": round(s["walk_med"]),
-            "lab": s["name"].split()[-1],
-            "tip": f"고령 {s['pop']:.0f}명 · 보행 중앙 {s['walk_med']:.0f} m"}
-            for s in STOPS])
-        L.append(pdk.Layer("ScatterplotLayer", sdf,
-                           get_position=["lon", "lat"],
-                           get_radius="120 + pop * 2.4", radius_min_pixels=7,
-                           radius_max_pixels=28,
-                           get_fill_color=[22, 112, 127, 205],
-                           stroked=True, get_line_color=[255, 255, 255, 230],
-                           line_width_min_pixels=1.5, pickable=True))
-        L.append(pdk.Layer("TextLayer", sdf, get_position=["lon", "lat"],
-                           get_text="lab", get_size=11, get_color=[255] * 3,
-                           get_alignment_baseline="'center'",
-                           font_weight=700, character_set="'auto'"))
-    if idle:
-        L.append(pdk.Layer("ScatterplotLayer", idle,
-                           get_position=["lon", "lat"], get_radius=240,
-                           radius_min_pixels=6, radius_max_pixels=14,
-                           get_fill_color=[140, 148, 153, 195],
-                           stroked=True, get_line_color=[255, 255, 255, 205],
-                           line_width_min_pixels=1, pickable=True))
-        L.append(pdk.Layer("TextLayer", idle, get_position=["lon", "lat"],
-                           get_text="lab", get_size=10, get_color=[255] * 3,
-                           get_alignment_baseline="'center'",
-                           font_weight=700, character_set="'auto'"))
-    if vehs:
-        L.append(pdk.Layer("ScatterplotLayer", vehs,
-                           get_position=["lon", "lat"], get_radius=320,
-                           radius_min_pixels=8, radius_max_pixels=18,
-                           get_fill_color=[70, 40, 120, 240], pickable=True))
-        L.append(pdk.Layer("TextLayer", vehs, get_position=["lon", "lat"],
-                           get_text="lab", get_size=11, get_color=[255] * 3,
-                           get_alignment_baseline="'center'",
-                           font_weight=700, character_set="'auto'"))
-    return pdk.Deck(
-        layers=L, map_provider="carto", map_style="light",
+        "lon": float(cl.lon.iloc[j]), "lat": float(cl.lat.iloc[j]),
+        "lab": (cl["name"].iloc[j][:12]
+                + f"  의사 {int(cl.doctors.iloc[j])}명")} for j in used])
+    return pdk.Deck(layers=[
+        pdk.Layer("PolygonLayer", dong, get_polygon="polygon", stroked=True,
+                  filled=False, get_line_color=[184, 84, 15, 130],
+                  line_width_min_pixels=2),
+        pdk.Layer("PathLayer",
+                  [{"path": r["path"], "w": 16 if r["rank"] == 0 else 7,
+                    "c": [22, 112, 127, 170] if r["rank"] == 0
+                         else [22, 112, 127, 60],
+                    "name": f"{r['stop_name']} → {r['name']}",
+                    "tip": f"{r['km']:.1f} km · {r['min']:.0f}분"} for r in RT],
+                  get_path="path", get_color="c", get_width="w",
+                  width_min_pixels=1, pickable=True, cap_rounded=True,
+                  joint_rounded=True),
+        pdk.Layer("ScatterplotLayer", cl, get_position=["lon", "lat"],
+                  get_radius="60 + doctors * 22", radius_min_pixels=3,
+                  radius_max_pixels=22, get_fill_color=[107, 74, 158, 170],
+                  pickable=True),
+        pdk.Layer("TextLayer", lab, get_position=["lon", "lat"],
+                  get_text="lab", get_size=12, get_color=[40, 52, 60],
+                  get_text_anchor="'start'", get_pixel_offset=[13, 0],
+                  get_alignment_baseline="'center'", background=True,
+                  get_background_color=[255, 255, 255, 226],
+                  background_padding=[5, 3, 5, 3], font_weight=600,
+                  font_family="'Malgun Gothic, Apple SD Gothic Neo, sans-serif'",
+                  character_set="'auto'"),
+        pdk.Layer("ScatterplotLayer", sdf, get_position=["lon", "lat"],
+                  get_radius="130 + pop * 2.4", radius_min_pixels=8,
+                  radius_max_pixels=30, get_fill_color=[22, 112, 127, 205],
+                  stroked=True, get_line_color=[255, 255, 255, 230],
+                  line_width_min_pixels=1.5, pickable=True),
+        pdk.Layer("TextLayer", sdf, get_position=["lon", "lat"],
+                  get_text="lab", get_size=11, get_color=[255, 255, 255],
+                  get_alignment_baseline="'center'", font_weight=700,
+                  character_set="'auto'"),
+    ], map_provider="carto", map_style="light",
         initial_view_state=pdk.ViewState(
-            longitude=B["view"][0], latitude=B["view"][1], zoom=11.3),
-        tooltip={"html": "<b>{name}</b><br/>{tip}{kind} · 의사 {on}/{doctors}"
-                         "명 · 대기 {waiting}명 ({wait_min}분)"},
-        height=486)
+            longitude=float(sdf.lon.mean()), latitude=float(sdf.lat.mean()),
+            zoom=11.4),
+        tooltip={"html": "<b>{name}</b><br/>{tip}{kind} · 의사 {doctors}명"},
+        height=470)
 
 
-# ── 그래프 ────────────────────────────────────────────────────────────
-def chart_stops():
-    if not STOPS:
-        return alt.Chart(pd.DataFrame({"x": [0], "y": [0]})).mark_text(
-            text="문 앞 호출 — 승차장이 없다", color="#888").encode()
-    d = pd.DataFrame([{"승차장": s["name"].split()[-1], "고령인구": s["pop"],
-                       "보행 중앙(m)": s["walk_med"]} for s in STOPS])
-    bar = alt.Chart(d).mark_bar(color=C1, cornerRadius=2).encode(
-        x=alt.X("승차장:N", sort=None, title=None),
-        y=alt.Y("고령인구:Q", title="맡은 고령인구 (명)"),
-        tooltip=["승차장", "고령인구", "보행 중앙(m)"])
-    line = alt.Chart(d).mark_line(color=C2, point=True, strokeWidth=2).encode(
-        x=alt.X("승차장:N", sort=None),
-        y=alt.Y("보행 중앙(m):Q", title="보행 중앙 (m)"))
-    return alt.layer(bar, line).resolve_scale(y="independent").properties(
-        height=186)
-
-
-def chart_co2(clock: float, ef: float):
-    R = sorted(SIM["rides"], key=lambda r: r["drop"])
-    rows, aR, aT = [], 0.0, 0.0
-    for r in R:
-        b = r["km_rev"] * sim.EF_TAXI / 2 / 1000
-        aR += b - r["km_rev"] * ef / 1000
-        aT += b - (r["km_rev"] + r["km_dead"]) * ef / 1000
-        if r["drop"] <= clock:
-            rows += [{"t": r["drop"] / 60, "kg": aR, "구분": "수송거리만"},
-                     {"t": r["drop"] / 60, "kg": aT, "구분": "공차 포함"}]
-    if not rows:
-        rows = [{"t": sim.T0 / 60, "kg": 0.0, "구분": "수송거리만"},
-                {"t": sim.T0 / 60, "kg": 0.0, "구분": "공차 포함"}]
-    d = pd.DataFrame(rows)
-    line = alt.Chart(d).mark_line(strokeWidth=2.4).encode(
-        x=alt.X("t:Q", title="시각",
-                scale=alt.Scale(domain=[sim.T0 / 60, END / 60])),
-        y=alt.Y("kg:Q", title="현행 대비 누적 (kg CO₂)"),
-        color=alt.Color("구분:N", scale=alt.Scale(
-            domain=["수송거리만", "공차 포함"], range=[C1, C2]),
-            legend=alt.Legend(orient="top", title=None)),
-        strokeDash=alt.StrokeDash("구분:N", scale=alt.Scale(
-            domain=["수송거리만", "공차 포함"], range=[[1, 0], [5, 3]]),
-            legend=None))
-    zero = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(
-        color="#888", strokeWidth=1.2).encode(y="y:Q")
-    return (zero + line).properties(height=186)
-
-
-def chart_hourly(clock: float):
-    h0, h1 = 8, int(np.ceil(END / 60))
-    d = pd.DataFrame([{
-        "시": f"{h}시",
-        "명": sum(r["n"] for r in SIM["rides"]
-                 if h * 60 <= r["drop"] < (h + 1) * 60),
-        "구분": "운행시간 후" if h >= 17 else "운행시간",
-        "지남": clock >= (h + 1) * 60} for h in range(h0, h1)])
-    return alt.Chart(d).mark_bar(cornerRadius=2).encode(
-        x=alt.X("시:N", sort=None, title=None),
-        y=alt.Y("명:Q", title="수송 인원"),
-        color=alt.Color("구분:N", scale=alt.Scale(
-            domain=["운행시간", "운행시간 후"], range=[C1, C2]),
-            legend=alt.Legend(orient="top", title=None)),
-        opacity=alt.Opacity("지남:N", scale=alt.Scale(
-            domain=[True, False], range=[1.0, 0.25]), legend=None),
-        tooltip=["시", "명"]).properties(height=186)
-
-
-board()
-
-# ── 실측 대조와 한계 ──────────────────────────────────────────────────
-st.divider()
-rt = SIM["km_rev"] / SIM["trips"]
-chk = [
-    ("일 통행수", f"{SIM['trips']}회", "78 (고령 946.5명 × 연 30회 ÷ 365)",
-     73 <= SIM["trips"] <= 83),
-    ("평균 재차인원", f"{SIM['occ']:.2f}명", "광교 실측 2.43–3.24",
-     SIM["occ"] >= 1.5),
-    ("평균 대기", f"{SIM['wait']:.0f}분", "수원 실측 14.5 / 고양 체감 30–40",
-     10 <= SIM["wait"] <= 45),
-    ("왕복 수송거리", f"{rt:.2f} km", "직선 6.90 × 실측 우회 1.38 = 9.52",
-     7.0 <= rt <= 12.0),
-    ("공차 비율", f"{100 * SIM['dead_share']:.0f}%", "DRT 통상 30–50",
-     20 <= 100 * SIM["dead_share"] <= 55),
-]
-l, r = st.columns(2)
-with l:
-    st.markdown("**실측 대조** — 시뮬레이션이 범위 안에서 도는가")
-    st.dataframe(pd.DataFrame(
-        [[a, b, c, "○" if d else "△"] for a, b, c, d in chk],
-        columns=["지표", "시뮬레이션", "기준", "판정"]),
-        hide_index=True, width="stretch")
-    st.markdown("**대상 지역 진단** — 실측·계산")
-    s = META["split"]["유형"]
-    st.dataframe(pd.DataFrame([
-        ["고령인구", f"{M['고령']:,.1f}명", "44격자 · 출발점 124"],
-        ["30분 내 의료기관", f"{M['A']:.2f}곳",
-         f"시 평균 {M['A_시평균']:.1f}곳의 {100 * M['A'] / M['A_시평균']:.2f}%"],
-        ["완전단절 격자", f"{M['완전단절_격자']}개",
-         f"80분에도 0곳 · 고령 {M['완전단절_고령']:,.1f}명"],
-        ["45분에도 미도달", f"{s['미도달']:,.1f}명",
-         f"{100 * s['미도달'] / M['고령']:.1f}% · 길이 없다"],
-        ["현행 똑버스까지", f"{M['똑버스_최단m'] / 1000:.1f} km",
-         f"최단 직선 · 중앙 {M['똑버스_중앙m'] / 1000:.1f} km"]],
-        columns=["항목", "값", "설명"]), hide_index=True, width="stretch")
-with r:
-    st.markdown("**차량 선택** — 손익분기 재차인원 (택시 2인 합승 대체)")
-    rows = []
-    for vv in sim.VEHICLES:
-        lo = vv["ef"] / (sim.EF_TAXI / 2)
-        hi = (vv["ef_hi"] or vv["ef"]) / (sim.EF_TAXI / 2)
-        dh = 1 - SIM["dead_share"]
-        rows.append({
-            "차량": vv["name"],
-            "수송거리만": f"{lo:.2f}" + (f"–{hi:.2f}" if hi > lo else ""),
-            "공차 포함": f"{lo / dh:.2f}" + (f"–{hi / dh:.2f}"
-                                       if hi > lo else ""),
-            "판정": "▲ 감축" if hi / dh <= SIM["occ"] else "▼ 증가"})
-    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+with mcol:
+    st.pydeck_chart(deck_map(), width="stretch")
     st.caption(
-        f"이 설정의 실제 재차인원은 **{SIM['occ']:.2f}명**. 고령 의료통행만으로는"
-        " 합승이 더 생기지 않는다 — 광교의 2.43~3.24는 전 연령·전 목적 수요에서"
-        " 나온 값이다. 손익분기 재차인원은 배출계수의 비라 거리 가정에 흔들리지"
-        " 않는다.")
-    if SIM["stops"]:
-        st.info(
-            f"**지정 승차장 {K}곳** — 같은 자리에서 타는 호출이 늘어 합승이"
-            f" 좋아지고 공차가 준다. 대신 고령자가 중앙 "
-            f"{SIM['walk_med']:.0f} m(0.8 m/s 로 {SIM['walk_min_med']:.1f}분),"
-            f" 멀면 {SIM['walk_max']:.0f} m 를 걸어야 한다. 승차장을 줄이면"
-            f" 탄소는 좋아지고 보행은 나빠진다.", icon="🚏")
+        "청록 큰 점 = 지정 승차장(크기는 맡은 고령인구, 번호는 인구 순위) · "
+        "청록 선 = 가까운 의원 3곳까지의 실제 도로 경로(진한 선이 최근접) · "
+        "보라 점 = 의료기관(크기는 의사 수) · 주황 테두리 = 가좌동·송포동 경계"
+        f" · 거리 출처 {D['meta']['거리출처']}")
+
+with scol:
+    st.markdown(f"**승차장 {K}곳** — 어디가 얼마를 맡는가")
+    sd = pd.DataFrame([{
+        "승차장": s["name"].split()[-1], "고령인구": s["pop"],
+        "격자": s["cells"], "보행 중앙": s["walk_med"],
+        "보행 최대": s["walk_max"]} for s in S])
+    st.dataframe(sd, hide_index=True, width="stretch", height=330)
+    far = sd[sd["보행 최대"] > 1000]
+    if len(far):
+        st.warning(
+            f"**{len(far)}곳은 가장 먼 사람이 1 km 넘게 걸어야 한다** "
+            f"(최대 {sd['보행 최대'].max():,.0f} m · 0.8 m/s 로 "
+            f"{sd['보행 최대'].max() / 0.8 / 60:.0f}분). 실제 선정에서는 그"
+            f" 덩어리를 쪼개야 한다.", icon="🚶")
+
+# ── 추천과 한계 ───────────────────────────────────────────────────────
+st.markdown("### 조건을 걸고 추려 보기")
+f1, f2, f3 = st.columns([1, 1, 2])
+w_max = f1.slider("보행 중앙 상한 (m)", 200, 600, 350, 25)
+t_max = f2.slider("평균 대기 상한 (분)", 10, 60, 30, 5)
+cand = ROWS[(ROWS.walk_med <= w_max) & (ROWS.wait <= t_max) & ROWS.in_hours]
+f3.caption(f"468개 조합 가운데 **{len(cand)}개**가 조건을 만족한다. "
+           "탄소가 나은 순으로 위 10개를 보인다.")
+if len(cand):
+    top = cand.nlargest(10, "cut_y").copy()
+    top["차종"] = [VEH[i]["name"] for i in top.vi]
+    st.dataframe(pd.DataFrame({
+        "차종": top["차종"], "대수": top.fleet, "승차장": top.k,
+        "연간 탄소 (t)": top.cut_y.round(1),
+        "보행 중앙 (m)": top.walk_med,
+        "평균 대기 (분)": top.wait.round(0),
+        "연간 비용 (억)": (top.cost_year / 1e8).round(1),
+        "재차 (명)": top.occ.round(2),
+    }), hide_index=True, width="stretch")
+else:
+    st.info("조건을 만족하는 조합이 없다. 상한을 늘려 보라.", icon="🔎")
+
+with st.expander("이 숫자들은 어디서 왔나 — 방법과 한계", expanded=False):
+    s = meta()["split"]["유형"]
+    a, b = st.columns(2)
+    a.markdown(f"""
+**대상** — 고양시 저접근 하위 25% 격자의 연결성분 가운데 1순위 군집
+(대표동 가좌동). 44격자 · 출발점 124 · **고령 {M['고령']:,.1f}명**.
+30분 안에 닿는 의료기관은 평균 **{M['A']:.2f}곳**으로 시 평균
+{M['A_시평균']:.1f}곳의 {100 * M['A'] / M['A_시평균']:.2f}%다.
+**{M['완전단절_격자']}격자**는 80분을 줘도 0곳이고, 45분을 줘도
+**{s['미도달']:,.0f}명({100 * s['미도달'] / M['고령']:.0f}%)**이 닿지 못한다.
+느린 것이 아니라 길이 없다.
+
+**수요** — 고령 의료통행만 센다. 실제 똑버스는 전 연령·전 목적이므로 여기서
+나오는 소요 자원은 **보수적 하한**이다. 고령 1인 연 {sim.TRIPS_PER_YEAR}회
+외래를 가정해 하루 78통행, 한 통행은 집→의원·의원→집 두 구간이다.
+
+**현행 기준** — 가좌·송포에는 갈 수 있는 대중교통이 없다. 지금 이 통행은
+택시나 자가용으로 이뤄지고 있다고 본다. 지금 고른 기준은 **{bl}**
+({BL_NOTE})이다. 기준을 바꾸면 부호가 바뀔 수 있어 고르게 해 두었다.
+""")
+    b.markdown(f"""
+**주행거리** — {D['meta']['거리출처']} 기준 실제 도로 경로. 운행 30 km/h.
+배차하러 빈 차로 가는 **공차**를 따로 세며, 이 운영에서 공차는 전체 주행의
+{100 * cur.dead_share:.0f}%다. 손익분기 재차인원은 배출계수의 비이므로 거리
+가정에 흔들리지 않는다.
+
+**배출계수** — 환경부 2021년 승인 국가계수. 택시 승용 중형 LPG
+{sim.EF_TAXI:.1f}, 자가용 승용 소형 휘발유 {sim.EF_CAR:.1f} g/대·km(30 km/h).
+전력 0.4747 kgCO₂/kWh(소비단). **국가계수에 소형승합이 없어** 쏠라티 디젤은
+승용 대형 경유~화물 소형 경유로 범위를 잡았다.
+
+**예산** — 표준운송원가 {sim.COST_DAY:,}원/대·일(수원시 2024 원가안).
+인건비와 차량 감가상각비를 포함하므로 차량 구입비를 따로 세지 않는다.
+
+**지정 승차장은 임시 가정이다** — 고령인구를 가중치로 둔 군집 중심을 도로에
+붙인 것이다. 실제 선정에는 보행 접근권, 정차 가능 지점, 소유관계 분석이 따로
+필요하다. 목록이 나오면 `sim.py` 의 `designated_stops()` 만 갈아끼우면 된다.
+
+**재차인원** — 고령 의료통행만으로는 합승이 {cur.occ:.2f}명에서 더 늘지
+않는다. 광교 실측 2.43~3.24명은 전 연령·전 목적 수요에서 나온 값이다.
+""")
 
 st.caption(
-    "**실시간 똑버스 운행 데이터는 공개되지 않는다.** 차량 움직임·탑승객·탄소"
-    " 누적은 광교 똑버스 실측 지표(호출 329,501건, 수원시정연구원 2024)로 만든"
-    " 가상 운행이며 고양시의 실제 운행이 아니다. 가좌·송포에는 아직 똑버스가"
-    " 없다. · **의원 실시간 현황도 가상이다** — 심평원이 주는 것은 기관별 인력"
-    " 현황이고, 실시간 진료 인원·대기 환자를 주는 공개 API 는 없다. 표의"
-    " 총의사수만 실제 자료다. · **지정 승차장도 임시 가정이다** — 고령인구를"
-    " 가중치로 둔 군집 중심을 도로에 붙인 것이며, 실제 선정에는 보행 접근권과"
-    " 정차 가능 지점 분석이 따로 필요하다. · **가정** — 고령 의료통행만 센다"
-    "(보수적 하한). 한 통행은 집→의원·의원→집 두 구간. 주행은 국가표준노드링크"
-    " 실제 도로 최단경로, 30 km/h. 배출계수는 환경부 2021년 승인 국가계수, 전력"
-    " 0.4747 kgCO₂/kWh(소비단). 운송원가 560,428원/대·일."
-    f" · 자료 생성 {M['생성']} · 고양시 고령자 의료접근성 연구 v6")
+    f"고양시 고령자 의료접근성 연구 v6 · 시나리오 {len(ROWS):,}개 "
+    f"(차종 {len(VEH)} × 대수 12 × 승차장 13) · 자료 생성 "
+    f"{D['meta']['생성']} · 운송원가·재차인원 수원시정연구원 2024"
+    f"(광교 똑버스 호출 329,501건)")
