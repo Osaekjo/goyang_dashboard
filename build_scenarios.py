@@ -75,6 +75,16 @@ def kakao_table(road: sim.Road, meta: dict, stops: list[dict],
             if v:
                 table[(("D", j), ("S", s["i"]))] = v["km"]
                 got += 1
+
+    # 승차장 → 승차장. 귀가 구간으로 승차장에 내린 차가 다른 승차장으로
+    # 태우러 갈 때의 공차다. 빼먹으면 표가 절반만 차고 나머지는 도로망으로
+    # 물러선다.
+    for s in stops:
+        res = kk.matrix(lonlat(s["x"], s["y"]), sl)
+        for s2, v in zip(stops, res):
+            if v and s2["i"] != s["i"]:
+                table[(("S", s["i"]), ("S", s2["i"]))] = v["km"]
+                got += 1
     return table, got
 
 

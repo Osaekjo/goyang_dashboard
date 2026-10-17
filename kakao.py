@@ -31,33 +31,48 @@ import requests
 
 HERE = Path(__file__).resolve().parent
 CACHE = HERE / "data" / "kakao_cache.json"
-MATRIX_URL = "https://apis-navi.kakaomobility.com/v1/destinations"
+MATRIX_URL = "https://apis-navi.kakaomobility.com/v1/destinations/directions"
 ROUTE_URL = "https://apis-navi.kakaomobility.com/v1/directions"
 MAX_DEST = 30               # /v1/destinations 한 번에 묻을 수 있는 목적지 수
 PAUSE = 0.12                # 연속 호출 사이 간격 (초)
 
 
-def api_key() -> str | None:
-    """.env → 환경변수 → Streamlit Secrets 순으로 찾는다."""
-    key = os.environ.get("KAKAO_REST_API_KEY", "").strip()
-    if not key:
-        env = HERE / ".env"
-        if env.exists():
-            for line in env.read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if line.startswith("KAKAO_REST_API_KEY=") and "#" not in line:
-                    key = line.split("=", 1)[1].strip().strip('"').strip("'")
-                    break
-    if not key:
-        try:
-            import streamlit as st
-            key = str(st.secrets.get("KAKAO_REST_API_KEY", "")).strip()
-        except Exception:
-            key = ""
+# 쓰는 사람마다 이름을 달리 적는다. 둘 다 받는다.
+KEY_NAMES = ("KAKAO_REST_API_KEY", "KAKAO_REST_KEY")
+
+
+def _clean(v: str) -> str:
+    v = v.strip().strip('"').strip("'").strip()
     # 안 채운 자리표시자를 키로 착각하지 않는다
-    if not key or "여기에" in key or key.lower() in {"none", "null"}:
-        return None
-    return key
+    return "" if (not v or "여기에" in v or v.lower() in {"none", "null"}) else v
+
+
+def api_key() -> str | None:
+    """환경변수 → .env → Streamlit Secrets 순으로 찾는다."""
+    for n in KEY_NAMES:
+        k = _clean(os.environ.get(n, ""))
+        if k:
+            return k
+    env = HERE / ".env"
+    if env.exists():
+        for line in env.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line.startswith("#") or "=" not in line:
+                continue
+            name, _, val = line.partition("=")
+            if name.strip() in KEY_NAMES:
+                k = _clean(val)
+                if k:
+                    return k
+    try:
+        import streamlit as st
+        for n in KEY_NAMES:
+            k = _clean(str(st.secrets.get(n, "")))
+            if k:
+                return k
+    except Exception:
+        pass
+    return None
 
 
 def _load() -> dict:
@@ -115,8 +130,8 @@ class Kakao:
                 "destinations": [
                     {"x": dests[i][0], "y": dests[i][1], "key": str(i)}
                     for i in chunk],
+                # 다중 목적지 쪽은 priority 를 받지 않는다. 넣으면 400 이다.
                 "radius": 10000,
-                "priority": "RECOMMEND",
             }
             try:
                 r = requests.post(
