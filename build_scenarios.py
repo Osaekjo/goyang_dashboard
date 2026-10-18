@@ -205,14 +205,18 @@ def main(use_kakao: bool, write: bool, S_m: float,
         "vehicles": [{"id": v["id"], "name": v["name"], "ef": round(v["ef"], 1),
                       "ef_hi": round(v["ef_hi"], 1) if v["ef_hi"] else None,
                       "cap": v["cap"]} for v in sim.VEHICLES],
-        "hubs": {n: {"onward_min": h["onward_min"], "note": h["note"]}
-                 for n, h in sim.HUBS.items()},
+        "hubs": list(sim.HUBS),
+        "hub_access": {n: {"nearest_min": v["nearest_min"],
+                           "nearest_name": v["nearest_name"],
+                           "walk5": v["walk_cum"][5],
+                           "walk10": v["walk_cum"][10],
+                           "A30": v["A"]["30"]}
+                       for n, v in sim.load_hub_access().items()},
         "meta": {"생성": time.strftime("%Y-%m-%d"),
                  "거리출처": "카카오모빌리티" if (kk and kk.ok)
                           else "국가표준노드링크 2025-05-12",
                  "S_m": S_m, "methods": list(modes),
-                 "기존정류장": len(FIX), "hub_target": sim.HUB_TARGET,
-                 "보행": "OSM 보행망 최단경로",
+                 "기존정류장": len(FIX), "보행": "OSM 보행망 최단경로",
                  "후보지": C.meta, "k": list(K_RANGE),
                  "fleet": list(FLEET_RANGE)},
     }
