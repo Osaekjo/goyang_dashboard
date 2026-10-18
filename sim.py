@@ -258,7 +258,8 @@ def simulate(road: Road, meta: dict, veh: dict, fleet: int,
             lj = legs[j]
             if lj["t"] - li["t"] > WIN:
                 break
-            if used[j] or len(grp) >= min(4, veh["cap"]):
+            if used[j] or len(grp) >= veh["cap"]:
+                # 정원까지 태운다. 11인승과 25인승이 달라지는 자리다.
                 continue
             if (math.hypot(lj["ax"] - li["ax"], lj["ay"] - li["ay"]) <= R_ORI
                     and math.hypot(lj["bx"] - li["bx"],
@@ -453,6 +454,41 @@ HUB_ALIGHT_MIN = 1.0      # 하차·환승 채비
 
 
 # ── 도달 ──────────────────────────────────────────────────────────────
+def stop_hub_min(road: Road, stops: list[dict]) -> np.ndarray:
+    """승차장 × 거점 차내시간(분). 배정과 도달 양쪽에서 쓴다."""
+    hub_xy = np.array([h["xy"] for h in HUBS.values()], float)
+    hn = road.snap(hub_xy)
+    row, dist, _ = road.solve(np.array([s["node"] for s in stops]))
+    out = np.full((len(stops), len(HUBS)), np.inf)
+    for s in stops:
+        out[s["i"]] = dist[row[s["node"]], hn] / 1000 / SPEED_KMH * 60
+    return np.where(np.isfinite(out), out, 999.0)
+
+
+def stop_cost(road: Road, meta: dict, stops: list[dict],
+              mode: str) -> np.ndarray:
+    """승차장에 타고 난 뒤 목적지까지 걸리는 시간(분).
+
+    배정을 이것까지 더해서 하면 "집에서 가깝지만 거점에서 먼" 승차장으로
+    사람이 몰리는 일이 없어진다. 사람은 **문앞에서 목적지까지 가장 빠른**
+    승차장으로 간다.
+    """
+    if mode == "hub":
+        acc = load_hub_access()
+        on = np.array([acc.get(n, {}).get("nearest_min", 5.0)
+                       for n in HUBS], float)
+        return (stop_hub_min(road, stops) + on[None, :]).min(1)
+    dest = np.array([[d[0], d[1]] for d in meta["dest"]], float)
+    dn = road.snap(dest)
+    row, dist, _ = road.solve(np.array([s["node"] for s in stops]))
+    out = np.zeros(len(stops))
+    for s in stops:
+        km = dist[row[s["node"]], dn] / 1000
+        out[s["i"]] = np.nanmin(np.where(np.isfinite(km), km, np.nan)) \
+            / SPEED_KMH * 60
+    return out
+
+
 def reach_tables(road: Road, meta: dict, stops: list[dict],
                  km_table: dict | None = None,
                  max_min: int = 90,
@@ -507,14 +543,7 @@ def reach_tables(road: Road, meta: dict, stops: list[dict],
             np.clip(np.ceil(t).astype(int), 0, max_min),
             minlength=max_min + 1).cumsum()
     # 승차장 → 거점 차내시간 (분). 거점 연계형에서 쓴다.
-    hub_xy = np.array([h["xy"] for h in HUBS.values()], float)
-    hn = road.snap(hub_xy)
-    rowh, disth, _ = road.solve(np.array([s["node"] for s in stops]))
-    hub_min = np.full((len(stops), len(HUBS)), np.inf)
-    for s in stops:
-        km = disth[rowh[s["node"]], hn] / 1000
-        hub_min[s["i"]] = km / SPEED_KMH * 60
-    hub_min = np.where(np.isfinite(hub_min), hub_min, 999.0)
+    hub_min = stop_hub_min(road, stops)
 
     return {"cell_stop": [int(v) for v in cs],
             "hub_min": np.round(hub_min, 2).tolist(),

@@ -145,15 +145,21 @@ def main(use_kakao: bool, write: bool, S_m: float,
               f"{time.perf_counter() - t:.0f}초")
 
     rows, stops_out, reach_out, cover = [], {}, {}, {}
+    for mode in modes:
+        reach_out[mode] = {}
     for k in K_RANGE:
         st = mclp.stops(C, ladder[k]["cids"], S_m, fixed=FIX)
         cids = sorted(set(ladder[k]["cids"]) | set(FIX))
-        wt = mclp.assign(C, cids)
         tab = rekey(T_cid, st) if T_cid else None
-        reach_out[str(k)] = sim.reach_tables(road, meta, st, tab, walk_tab=wt)
         stops_out[str(k)] = serialize(st)
         cover[str(k)] = round(ladder[k]["cov_share"], 4)
         for mode in modes:
+            # 사람은 문앞에서 목적지까지 가장 빠른 승차장으로 간다. 그 '목적지
+            # 까지' 가 방식마다 다르므로 배정도 방식마다 다시 한다.
+            cst = sim.stop_cost(road, meta, st, mode)
+            wt = mclp.assign(C, cids, cst)
+            reach_out[mode][str(k)] = sim.reach_tables(
+                road, meta, st, tab, walk_tab=wt)
             for vi, veh in enumerate(sim.VEHICLES):
                 for f in FLEET_RANGE:
                     S = sim.simulate(road, meta, veh, f, stops=st,
@@ -165,6 +171,8 @@ def main(use_kakao: bool, write: bool, S_m: float,
                         "stops_total": len(st),
                         "cover_share": round(ladder[k]["cov_share"], 4),
                         "occ": round(S["occ"], 3),
+                        "occ_max": int(max(r.n for r in S["rides"])),
+                        "cap": veh["cap"],
                         "wait": round(S["wait"], 1),
                         "wait_p90": round(float(np.percentile(w, 90)), 1),
                         "km_rev": round(S["km_rev"], 1),
@@ -228,7 +236,7 @@ def main(use_kakao: bool, write: bool, S_m: float,
             if not r:
                 continue
             fn = sim.reach_hub if mode == "hub" else sim.reach
-            rc = fn(reach_out["4"], 30, r["wait"])
+            rc = fn(reach_out[mode]["4"], 30, r["wait"])
             print(f"  {mode:<7} 신설4·{f:>2}대 · 재차 {r['occ']:.2f} · 대기 "
                   f"{r['wait']:>5.0f}분 · 30분 도달 {100 * rc['drt_share']:.1f}%"
                   f" · 연 탄소 {r['cut_year_t']:+.1f} t")

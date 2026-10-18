@@ -205,7 +205,7 @@ if not hasattr(sim, "reach_hub"):
     st.stop()
 REACH = sim.reach_hub if SEL == "hub" else sim.reach
 cur = ROWS[(ROWS.vi == vi) & (ROWS.fleet == fleet) & (ROWS.k == K)].iloc[0]
-TAB = D["reach"][str(K)]
+TAB = D["reach"][SEL][str(K)]
 R0 = REACH(TAB, BUD, float(cur.wait))
 
 
@@ -216,7 +216,7 @@ def carbon_of(df: pd.DataFrame) -> pd.Series:
 def reach_of(k: int, fleet_: int, budget: int) -> dict:
     w = float(ROWS[(ROWS.k == k) & (ROWS.fleet == fleet_)
                    & (ROWS.vi == 0)].iloc[0].wait)
-    return REACH(D["reach"][str(k)], budget, w)
+    return REACH(D["reach"][SEL][str(k)], budget, w)
 
 
 # ── 핵심 수치 ─────────────────────────────────────────────────────────
@@ -277,7 +277,9 @@ cut = float(carbon_of(pd.DataFrame([cur])).iloc[0])
 SM = D["meta"].get("S_m", 600)
 k = st.columns(5)
 k[0].metric("평균 대기", f"{cur.wait:,.0f}분",
-            f"10번 중 1번은 {cur.wait_p90:,.0f}분 이상", delta_color="off")
+            f"10번 중 1번은 {cur.wait_p90:,.0f}분 이상 · 재차 {cur.occ:.1f}명"
+            f" (최대 {int(cur.occ_max)}명 / 정원 {int(cur.cap)}명)",
+            delta_color="off")
 k[1].metric("집→승차장 보행", f"{R0['walk_min']:.1f}분",
             f"중앙 {cur.walk_med:,.0f} m · "
             + ("실제 보행망" if SEL == "mclp" else "직선 추정"),
@@ -318,7 +320,7 @@ GKEY = {(g[0], g[1]): i for i, g in enumerate(GRID)}
 def grid_cells(k_: int, sel: str = "") -> list[int]:
     """출발점마다 속한 500m 격자 번호. 격자망이 500m 로 떨어져 있다."""
     out = []
-    for x, y in D["reach"][str(k_)]["cell_xy"]:
+    for x, y in D["reach"][SEL][str(k_)]["cell_xy"]:
         gx = GX0 + ((x - GX0) // 500) * 500
         gy = GY0 + ((y - GY0) // 500) * 500
         out.append(GKEY.get((gx, gy), -1))
@@ -404,7 +406,7 @@ def payload_kakao() -> dict:
 kakao_map.render(payload_kakao(), height=560)
 st.caption(
     "격자 색 — **회색** 원래 닿던 곳 · **청록** 새로 닿게 됨 · "
-    "**주황** 그래도 못 닿음. 큰 청록 점이 지정 승차장(크기는 맡은 고령인구),"
+    "**주황** 그래도 못 닿음. 큰 점이 지정 승차장(크기는 맡은 고령인구)이고,"
     " 선은 가까운 의원까지의 실제 도로 경로다. 도형에 마우스를 올리면 왼쪽"
     f" 아래에 설명이 뜬다. 주행거리 출처 {D['meta']['거리출처']}"
     + (f" (이 조합의 {100 * cur.kakao:.0f}%, 나머지는 국가표준노드링크 —"
@@ -588,6 +590,8 @@ def c_carbon():
     d = ROWS[(ROWS.fleet == fleet) & (ROWS.k == K)].copy()
     d["차종"] = [VEH[i]["name"] for i in d.vi]
     d["연간 탄소(t)"] = carbon_of(d)
+    d["정원"], d["최대 탑승"] = d.cap, d.occ_max
+    d["평균 재차"] = d.occ.round(2)
     bar = alt.Chart(d).mark_bar(cornerRadius=4, size=46).encode(
         y=alt.Y("차종:N", sort=None, title=None,
                 axis=alt.Axis(labelLimit=220, labelFontSize=13)),
@@ -595,7 +599,7 @@ def c_carbon():
                 axis=alt.Axis(labelFontSize=13, titleFontSize=13)),
         color=alt.condition(alt.datum["연간 탄소(t)"] >= 0,
                             alt.value(C1), alt.value(C2)),
-        tooltip=["차종", "연간 탄소(t)", "breakeven_dead", "occ"])
+        tooltip=["차종", "연간 탄소(t)", "정원", "최대 탑승", "평균 재차"])
     lab = alt.Chart(d).mark_text(align="left", dx=6, fontSize=14,
                                  fontWeight=700).encode(
         y=alt.Y("차종:N", sort=None), x="연간 탄소(t):Q",
@@ -605,12 +609,18 @@ def c_carbon():
     zero = alt.Chart(pd.DataFrame({"x": [0]})).mark_rule(
         color="#555", strokeWidth=1.6).encode(x="x:Q")
     return (bar + zero + lab), (
-        f"{fleet}대 · 승차장 {K}곳 · 현행 {bl} 대비. 이 설정의 실제"
-        f" 재차인원은 {cur.occ:.2f}명, 손익분기는 공차까지 세면"
-        f" {cur.breakeven_dead:.2f}명이다. 고령 의료통행만으로는 합승이 더"
-        f" 생기지 않는다 — 광교의 2.43~3.24는 전 연령·전 목적 수요에서 나온"
-        f" 값이다. **탄소는 똑버스 도입의 근거가 아니다. 근거는 접근성이고,"
-        f" 차종 선택으로 손해를 줄이는 것이다.**")
+        f"{fleet}대 · 신설 {K}곳 · 현행 {bl} 대비. 이 설정에서 한 차에 가장 "
+        f"많이 탄 인원은 **{int(d.occ_max.max())}명**, 평균 재차는 "
+        f"{cur.occ:.2f}명이다."
+        + (" 세 차종의 재차·대기·주행이 **모두 같다** — 정원이 걸리는 것이 "
+           "아니라 **수요가 상한**이기 때문이다. 하루 78통행을 35분 창으로 "
+           "묶으면 더 모이지 않아, 25인승을 넣어도 빈 자리를 싣고 다닌다. "
+           "그래서 차종은 **배출계수만** 바꾼다."
+           if d.occ.nunique() == 1 else
+           " 정원이 작은 차는 합승이 끊겨 재차가 낮아진다.")
+        + f" 손익분기는 공차까지 세면 {cur.breakeven_dead:.2f}명이다. "
+        f"**탄소는 똑버스 도입의 근거가 아니다. 근거는 접근성이고, 차종 "
+        f"선택으로 손해를 줄이는 것이다.**")
 
 
 def c_cost():
@@ -759,7 +769,7 @@ OSM 보행망 최단경로이고, 이 지역에서 **직선의 1.34배**(상위 
 """)
 
 st.caption(
-    f"고양시 고령자 의료접근성 연구 v6 · 시나리오 {len(ROWS):,}개 "
-    f"(차종 {len(VEH)} × 대수 12 × 승차장 13) × 예산 3 · 자료 생성 "
+    f"고양시 고령자 의료접근성 연구 v6 · 시나리오 {len(D['rows']):,}개 "
+    f"(운영방식 2 × 차종 {len(VEH)} × 대수 12 × 신설 13) · 자료 생성 "
     f"{D['meta']['생성']} · 운송원가·재차인원 수원시정연구원 2024"
     f"(광교 똑버스 호출 329,501건) · 배경지도 카카오맵")

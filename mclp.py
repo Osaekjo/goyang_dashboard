@@ -178,17 +178,26 @@ def solve(C: Cands, k: int, S_m: float, *,
             "base_share": float(C.pop[base].sum() / C.pop.sum())}
 
 
-def assign(C: Cands, cids: list[int]) -> tuple[np.ndarray, np.ndarray]:
-    """수요점 → (배정된 승차장의 리스트 위치, 보행거리 m).
+def assign(C: Cands, cids: list[int],
+           cost: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
+    """수요점 → (배정된 승차장의 리스트 위치, 그 승차장까지 보행거리 m).
 
-    커버 밖 사람도 가장 가까운 승차장까지 걸어서 탄다 — MCLP 는 어디에 놓을지만
-    정한다. 보행망에서 끊긴 쌍은 직선 × 1.4 로 물러선다.
+    cost 를 주면 **문앞에서 목적지까지 가장 빠른** 승차장을 고른다
+    (보행시간 + 그 승차장에서 목적지까지 걸리는 시간). 안 주면 가장 가까운
+    승차장이다. 보행만 보면 "집에선 가깝지만 거점에서 먼" 자리로 몰려
+    승차장을 늘릴수록 도달이 나빠지는 일이 생긴다.
+
+    커버 밖 사람도 걸어서 탄다 — MCLP 는 어디에 놓을지만 정한다.
+    보행망에서 끊긴 쌍은 직선 × 1.4 로 물러선다.
     """
     W = C.walk[:, cids].copy()
     S = np.hypot(C.xy[:, None, 0] - C.cx[cids][None, :],
                  C.xy[:, None, 1] - C.cy[cids][None, :]) * WALK_DETOUR
     W = np.where(np.isfinite(W), W, S)
-    j = W.argmin(1)
+    if cost is None:
+        j = W.argmin(1)
+    else:
+        j = (W / WALK_SPEED / 60 + np.asarray(cost, float)[None, :]).argmin(1)
     return j, W[np.arange(len(W)), j]
 
 
