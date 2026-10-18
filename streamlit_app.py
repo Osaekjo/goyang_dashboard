@@ -22,7 +22,36 @@ import streamlit as st
 from pyproj import Transformer
 
 import kakao_map
+import keys
+import mclp
 import sim
+
+
+def _hot_reload() -> None:
+    """고친 모듈이 실제로 쓰이게 한다.
+
+    Streamlit Cloud 는 푸시하면 streamlit_app.py 만 다시 읽고, 이미 import 된
+    모듈은 sys.modules 에 그대로 둔다. 그래서 sim.py 에 함수를 더해도 배포본은
+    옛 모듈을 보고 AttributeError 를 낸다. 파일이 바뀐 모듈만 다시 읽고,
+    바뀌었으면 캐시도 비운다 — 캐시에 담긴 객체는 옛 클래스로 만들어졌다.
+    """
+    import importlib
+    changed = []
+    for m in (keys, sim, mclp, kakao_map):
+        s = Path(m.__file__).stat()
+        sig = (s.st_size, s.st_mtime_ns)
+        old = getattr(m, "_file_sig", None)
+        if old is not None and old != sig:
+            importlib.reload(m)
+            changed.append(Path(m.__file__).name)
+        setattr(m, "_file_sig", sig)
+    if changed:
+        st.cache_data.clear()
+        st.cache_resource.clear()
+        st.caption("모듈을 다시 읽었습니다 — " + ", ".join(changed))
+
+
+_hot_reload()
 
 HERE = Path(__file__).resolve().parent
 TO_WGS = Transformer.from_crs(5179, 4326, always_xy=True)
@@ -172,6 +201,12 @@ bl = c[4].selectbox("현행(탄소 비교 기준)", list(BASELINE), index=0,
 BL_NOTE, BL_EF, BL_OCC = BASELINE[bl]
 
 ROWS = ROWS[ROWS.sel == SEL]
+if not hasattr(sim, "reach_hub"):
+    st.error(
+        "서버가 옛 `sim.py` 를 들고 있습니다 — 거점 연계 함수가 없습니다.\n\n"
+        "배포본이라면 **Manage app → ⋮ → Reboot app** 으로 다시 띄워 주세요.",
+        icon="🔄")
+    st.stop()
 REACH = sim.reach_hub if SEL == "hub" else sim.reach
 cur = ROWS[(ROWS.vi == vi) & (ROWS.fleet == fleet) & (ROWS.k == K)].iloc[0]
 TAB = D["reach"][str(K)]
