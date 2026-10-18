@@ -58,6 +58,10 @@ class Cands:
     node: np.ndarray        # (N,) 차량 도로망 노드
     spd: np.ndarray         # (N,) 접한 링크 최저 제한속도
     exist: np.ndarray       # (N,) 실재 정류장인가
+    stoppable: np.ndarray   # (N,) 차를 세울 수 있는 자리인가
+    in_area: np.ndarray     # (N,) 군집 400m 안인가
+    needs_check: np.ndarray  # (N,) 편도 1차로 — 정차 여건 확인 필요
+    lanes: np.ndarray       # (N,) 차로수
     stop_id: np.ndarray
     stop_name: np.ndarray
     meta: dict
@@ -90,6 +94,8 @@ def load_cands(meta: dict, path: Path = DATA / "walk_cand.npz") -> Cands:
     return Cands(w, pop, P, z["cand_x"].astype(float),
                  z["cand_y"].astype(float), z["cand_node"],
                  z["cand_spd"].astype(float), z["cand_exist"],
+                 z["cand_stoppable"], z["cand_in_area"],
+                 z["cand_needs_check"], z["cand_lanes"].astype(float),
                  z["cand_stop_id"], z["cand_stop_name"],
                  json.loads(str(z["meta"][0])))
 
@@ -103,45 +109,73 @@ def coverage(C: Cands, S_m: float,
     return N
 
 
+def base_stops(C: Cands) -> list[int]:
+    """똑버스가 그냥 쓸 수 있는 자리 — 군집 안팎의 실재 버스정류장 폴.
+
+    수요응답형은 노선이 없으므로 **이미 서 있는 정류장은 공짜로 쓴다.**
+    새로 만들 것은 그 위에 얹는 몫이다.
+    """
+    return [int(j) for j in np.where(C.exist & C.in_area)[0]]
+
+
 def solve(C: Cands, k: int, S_m: float, *,
-          exclude_fast_kmh: float | None = None,
+          fixed: list[int] | None = None,
           force: set[int] | None = None) -> dict:
-    """MCLP 한 판. 고른 후보 번호와 커버인구를 돌려준다."""
-    N = coverage(C, S_m, exclude_fast_kmh)
-    live = N.any(0)                       # 아무도 못 덮는 후보는 뺀다
+    """기존 정류장(fixed)은 그대로 두고 **신설 k곳**을 고른다.
+
+    신설 후보는 **정차할 수 있는 자리**로만 한정한다 — 편도 1차로나 설계속도가
+    높은 간선에는 차를 세울 수 없다. 실재 정류장 폴은 이미 정차지다.
+    """
+    fixed = list(fixed or [])
+    N = coverage(C, S_m)
+    base = N[:, fixed].any(1) if fixed else np.zeros(len(C.pop), bool)
+
+    # 신설 후보: 정차 가능하고, 아직 안 덮인 수요를 하나라도 덮는 것
+    allow = C.stoppable & ~C.exist
+    gain = N & ~base[:, None]
+    live = allow & gain.any(0)
     if force:
         live[list(force)] = True
     cols = np.where(live)[0]
-    rows = np.where(N.any(1))[0]          # 아무 후보로도 못 덮이는 수요는 뺀다
-    A = csr_matrix(N[np.ix_(rows, cols)].astype(float))
-    nN, nI = len(cols), len(rows)
+    rows = np.where(gain.any(1) & live[None, :].any() & ~base)[0]
+    if k == 0 or len(cols) == 0 or len(rows) == 0:
+        cov = base
+        return {"cids": [], "fixed": fixed,
+                "cov_pop": float(C.pop[cov].sum()),
+                "cov_share": float(C.pop[cov].sum() / C.pop.sum()),
+                "cov_cells": int(cov.sum()), "base_share":
+                float(C.pop[base].sum() / C.pop.sum())}
 
-    # 목적 — 1순위 커버인구(최대), 2순위 실재 정류장, 3순위 보행
+    A = csr_matrix(gain[np.ix_(rows, cols)].astype(float))
+    nN, nI = len(cols), len(rows)
     gw = np.where(np.isfinite(C.walk), np.minimum(C.walk, 3000), 3000)
     gw = (gw[rows][:, cols] * C.pop[rows, None]).sum(0) / C.pop.sum() / 1000
-    c = np.r_[EPS_WALK * gw - EPS_EXIST * C.exist[cols].astype(float),
-              -C.pop[rows]]
-
+    c = np.r_[EPS_WALK * gw, -C.pop[rows]]
     lo = np.zeros(nN + nI)
     if force:
         for j in force:
-            lo[int(np.searchsorted(cols, j))] = 1
+            w = int(np.searchsorted(cols, j))
+            if w < nN and cols[w] == j:
+                lo[w] = 1
     r = milp(
         c,
         constraints=[
             LinearConstraint(hstack([-A, eye(nI, format="csr")]).tocsr(),
                              -np.inf, 0),
-            LinearConstraint(np.r_[np.ones(nN), np.zeros(nI)], k, k)],
+            LinearConstraint(np.r_[np.ones(nN), np.zeros(nI)],
+                             min(k, nN), min(k, nN))],
         integrality=np.r_[np.ones(nN), np.zeros(nI)],
         bounds=Bounds(lo, 1),
         options={"time_limit": 120, "mip_rel_gap": 0.0})
     if not r.success:
         raise RuntimeError(f"MCLP k={k} S={S_m} 풀이 실패: {r.message}")
     cids = sorted(int(cols[j]) for j in np.where(r.x[:nN] > .5)[0])
-    cov = N[:, cids].any(1)
-    return {"cids": cids, "cov_pop": float(C.pop[cov].sum()),
+    cov = base | N[:, cids].any(1)
+    return {"cids": cids, "fixed": fixed,
+            "cov_pop": float(C.pop[cov].sum()),
             "cov_share": float(C.pop[cov].sum() / C.pop.sum()),
-            "cov_cells": int(cov.sum()), "sec": float(r.mip_dual_bound or 0)}
+            "cov_cells": int(cov.sum()),
+            "base_share": float(C.pop[base].sum() / C.pop.sum())}
 
 
 def assign(C: Cands, cids: list[int]) -> tuple[np.ndarray, np.ndarray]:
@@ -158,7 +192,8 @@ def assign(C: Cands, cids: list[int]) -> tuple[np.ndarray, np.ndarray]:
     return j, W[np.arange(len(W)), j]
 
 
-def stops(C: Cands, cids: list[int], S_m: float) -> list[dict]:
+def stops(C: Cands, cids: list[int], S_m: float,
+          fixed: list[int] | None = None) -> list[dict]:
     """sim 이 먹는 승차장 목록.
 
     **리스트 위치 == i 불변식**을 지킨다. km_table 열쇠 ("S", i), reach 의
@@ -169,7 +204,8 @@ def stops(C: Cands, cids: list[int], S_m: float) -> list[dict]:
     """
     from pyproj import Transformer
     T = Transformer.from_crs(5179, 4326, always_xy=True)
-    cids = sorted(cids)
+    new = set(cids)
+    cids = sorted(set(cids) | set(fixed or []))
     j, wm = assign(C, cids)
     N = coverage(C, S_m)
     out = []
@@ -188,6 +224,10 @@ def stops(C: Cands, cids: list[int], S_m: float) -> list[dict]:
             "walk_med": int(np.median(wm[m])) if m.any() else 0,
             "walk_max": int(wm[m].max()) if m.any() else 0,
             "exist": bool(C.exist[cid]),
+            "is_new": bool(cid in new),
+            "stoppable": bool(C.stoppable[cid]),
+            "needs_check": bool(C.needs_check[cid]),
+            "lanes": int(C.lanes[cid]),
             "stop_name": str(C.stop_name[cid]) if C.exist[cid] else "",
             "spd_min": round(float(C.spd[cid]), 0),
             "name": f"가좌·송포 {p + 1:02d}",
@@ -214,13 +254,14 @@ def cids_of(C: Cands, stops: list[dict], tol: float = 1.0) -> list[int]:
 
 
 def solve_ladder(C: Cands, ks, S_m: float, *, nested: bool = False,
-                 **kw) -> dict[int, dict]:
-    """k 를 훑으며 푼다. nested 면 직전 해를 유지시킨다(슬라이더가 매끄럽다)."""
+                 fixed: list[int] | None = None, **kw) -> dict[int, dict]:
+    """신설 수 k 를 훑으며 푼다. 기존 정류장(fixed)은 늘 열려 있다."""
+    fixed = base_stops(C) if fixed is None else fixed
     out, prev = {}, None
     for k in ks:
-        r = solve(C, k, S_m, force=set(prev) if (nested and prev) else None,
-                  **kw)
-        r["new"] = sorted(set(r["cids"]) - set(prev or []))
+        r = solve(C, k, S_m, fixed=fixed,
+                  force=set(prev) if (nested and prev) else None, **kw)
+        r["added"] = sorted(set(r["cids"]) - set(prev or []))
         r["dropped"] = sorted(set(prev or []) - set(r["cids"]))
         out[k] = r
         prev = r["cids"]
@@ -232,8 +273,8 @@ if __name__ == "__main__":
     import time
     ap = argparse.ArgumentParser()
     ap.add_argument("--S", type=float, default=500.0)
-    ap.add_argument("--kmin", type=int, default=4)
-    ap.add_argument("--kmax", type=int, default=16)
+    ap.add_argument("--kmin", type=int, default=0)
+    ap.add_argument("--kmax", type=int, default=12)
     ap.add_argument("--nested", action="store_true")
     a = ap.parse_args()
     meta = json.loads((DATA / "data.json").read_text(encoding="utf-8"))
@@ -241,15 +282,18 @@ if __name__ == "__main__":
     print(f"수요 {len(C.pop)} · 후보 {C.n:,} · 기준 S={a.S:.0f} m "
           f"({a.S / WALK_SPEED / 60:.1f}분)")
     t = time.perf_counter()
-    L = solve_ladder(C, range(a.kmin, a.kmax + 1), a.S, nested=a.nested)
+    F = base_stops(C)
+    print(f"기존 정류장 {len(F)}곳 (군집 400 m 내) — 그 위에 신설을 얹는다")
+    L = solve_ladder(C, range(a.kmin, a.kmax + 1), a.S, nested=a.nested,
+                     fixed=F)
     print(f"{len(L)}개 k · {time.perf_counter() - t:.1f}초")
-    print(f"{'k':>3}{'커버명':>10}{'커버%':>8}{'실재정류장':>10}"
-          f"{'신규':>6}{'탈락':>6}{'보행중앙':>9}")
+    print(f"{'신설':>4}{'정류장계':>9}{'커버명':>10}{'커버%':>8}"
+          f"{'기존만':>8}{'보행중앙':>10}")
     for k, r in L.items():
-        ss = stops(C, r["cids"], a.S)
-        print(f"{k:>3}{r['cov_pop']:>9.1f}{100 * r['cov_share']:>7.1f}%"
-              f"{sum(s['exist'] for s in ss):>9}곳{len(r['new']):>5}"
-              f"{len(r['dropped']):>6}"
-              f"{int(np.median([s['walk_med'] for s in ss])):>8}m")
-    U = sorted({c for r in L.values() for c in r["cids"]})
-    print(f"k 전체 합집합 {len(U)}곳 — 카카오는 이만큼만 받으면 된다")
+        ss = stops(C, r["cids"], a.S, fixed=F)
+        print(f"{k:>4}{len(ss):>8}곳{r['cov_pop']:>9.1f}"
+              f"{100 * r['cov_share']:>7.1f}%{100 * r['base_share']:>7.1f}%"
+              f"{int(np.median([s['walk_med'] for s in ss])):>9}m")
+    U = sorted({c for r in L.values() for c in r["cids"]} | set(F))
+    print(f"전체 합집합 {len(U)}곳 (기존 {len(F)} + 신설 "
+          f"{len(U) - len(F)}) — 카카오는 이만큼만 받으면 된다")

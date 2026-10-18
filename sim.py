@@ -138,7 +138,8 @@ class Ride:
 def simulate(road: Road, meta: dict, veh: dict, fleet: int,
              seed: int = 20261016, stops: list[dict] | None = None,
              km_table: dict | None = None,
-             walk_tab: tuple[np.ndarray, np.ndarray] | None = None) -> dict:
+             walk_tab: tuple[np.ndarray, np.ndarray] | None = None,
+             mode: str = "direct") -> dict:
     """지정 승차장에서 태워 의원까지 나른다.
 
     똑버스는 지정 승차장 운영이다. 고령자가 승차장까지 걷는 거리도 함께
@@ -157,9 +158,14 @@ def simulate(road: Road, meta: dict, veh: dict, fleet: int,
     w = np.array([c[3] for c in cells], float)
     ox = np.array([c[0] + 125 for c in cells], float)
     oy = np.array([c[1] + 125 for c in cells], float)
-    dest = np.array([[d[0], d[1]] for d in meta["dest"]], float)
-    dw = np.array([1 + (4 if d[2] >= 10 else 0) + (1 if d[2] > 0 else 0)
-                   for d in meta["dest"]], float)
+    if mode == "hub":
+        # 거점 연계형 — 똑버스는 거점까지만 태운다. 구간이 짧아 차량이 적게 든다.
+        dest = np.array([h["xy"] for h in HUBS.values()], float)
+        dw = np.ones(len(dest))
+    else:
+        dest = np.array([[d[0], d[1]] for d in meta["dest"]], float)
+        dw = np.array([1 + (4 if d[2] >= 10 else 0) + (1 if d[2] > 0 else 0)
+                       for d in meta["dest"]], float)
 
     n_trip = round(meta["meta"]["고령"] * TRIPS_PER_YEAR / 365)
     oi = rnd.choice(len(cells), size=n_trip, p=w / w.sum())
@@ -169,10 +175,16 @@ def simulate(road: Road, meta: dict, veh: dict, fleet: int,
     # 목적지 — 가까울수록, 내과 전문의가 많을수록. 지수 6.0 은 평균 왕복이
     # v6 탄소장의 6.90~10.54 km(직선) 범위에 들도록 맞춘 값이다.
     di = np.empty(n_trip, int)
-    for i in range(n_trip):
-        km = np.hypot(dest[:, 0] - ox[oi[i]], dest[:, 1] - oy[oi[i]]) / 1000
-        p = dw / (1 + km) ** 6.0
-        di[i] = rnd.choice(len(dest), p=p / p.sum())
+    if mode == "hub":
+        on = np.array([h["onward_min"] for h in HUBS.values()], float)
+        for i in range(n_trip):
+            km = np.hypot(dest[:, 0] - ox[oi[i]], dest[:, 1] - oy[oi[i]]) / 1000
+            di[i] = int(np.argmin(km * 1.34 / SPEED_KMH * 60 + on))
+    else:
+        for i in range(n_trip):
+            km = np.hypot(dest[:, 0] - ox[oi[i]], dest[:, 1] - oy[oi[i]]) / 1000
+            p = dw / (1 + km) ** 6.0
+            di[i] = rnd.choice(len(dest), p=p / p.sum())
 
     # 승차 지점 — 가장 가까운 지정 승차장. 거기까지는 걸어간다.
     if not stops:
@@ -280,6 +292,7 @@ def simulate(road: Road, meta: dict, veh: dict, fleet: int,
     ww = np.repeat(walk, 2)          # 구간마다 같은 보행이 한 번씩 붙는다
     n_pair = 2 * len(rides)          # 배차마다 공차 1 + 수송 1
     return {"rides": rides, "trips": n_trip, "pax": pax, "fleet": fleet,
+            "mode": mode,
             "occ": pax / len(rides), "km_rev": km_rev, "km_dead": km_dead,
             "km": km_rev + km_dead, "wait": wait,
             "end": max(r.drop for r in rides), "veh": veh,
@@ -396,6 +409,23 @@ def stop_routes(road: Road, stops: list[dict], meta: dict,
     return out
 
 
+# ── 거점 연계 ─────────────────────────────────────────────────────────
+# 고봉동 똑버스가 그렇듯 수요응답형은 보통 **거점까지만** 태워주고 거기서
+# 기존 대중교통으로 갈아탄다. 구간이 짧아 2~3대로 돌아간다.
+#
+# 거점에서 목적지까지 걸리는 시간은 협업자 분석(ParkJH0313/goyang-senior-mobility,
+# dashboard/dist/data.json 의 access.onward)에서 가져왔다. 대화역은 일산백병원이
+# 380 m 거리라 도보 8.9분, 일산서구청은 대중교통으로 평균 14.2분이다.
+HUB_TARGET = "인제대학교일산백병원"
+HUBS = {
+    "대화역": {"xy": (933643.0, 1964360.0), "onward_min": 8.9,
+             "note": "일산백병원까지 도보 약 430 m"},
+    "일산서구청": {"xy": (935203.0, 1964889.0), "onward_min": 14.2,
+                "note": "일산백병원까지 대중교통 환승"},
+}
+HUB_ALIGHT_MIN = 1.0      # 하차·환승 채비
+
+
 # ── 도달 ──────────────────────────────────────────────────────────────
 def reach_tables(road: Road, meta: dict, stops: list[dict],
                  km_table: dict | None = None,
@@ -450,12 +480,62 @@ def reach_tables(road: Road, meta: dict, stops: list[dict],
         hist[s["i"]] = np.bincount(
             np.clip(np.ceil(t).astype(int), 0, max_min),
             minlength=max_min + 1).cumsum()
+    # 승차장 → 거점 차내시간 (분). 거점 연계형에서 쓴다.
+    hub_xy = np.array([h["xy"] for h in HUBS.values()], float)
+    hn = road.snap(hub_xy)
+    rowh, disth, _ = road.solve(np.array([s["node"] for s in stops]))
+    hub_min = np.full((len(stops), len(HUBS)), np.inf)
+    for s in stops:
+        km = disth[rowh[s["node"]], hn] / 1000
+        hub_min[s["i"]] = km / SPEED_KMH * 60
+    hub_min = np.where(np.isfinite(hub_min), hub_min, 999.0)
+
     return {"cell_stop": [int(v) for v in cs],
+            "hub_min": np.round(hub_min, 2).tolist(),
+            "hub_names": list(HUBS),
+            "hub_onward": [h["onward_min"] for h in HUBS.values()],
             "cell_walk": np.round(walk, 2).tolist(),
             "cell_walk_m": np.round(walk_m, 0).tolist(),
             "cell_pop": pop.tolist(), "cell_now": now.tolist(),
             "cell_xy": [[int(c[0]), int(c[1])] for c in cells],
             "hist": hist.tolist(), "max_min": max_min}
+
+
+def reach_hub(tab: dict, budget: float, wait: float) -> dict:
+    """거점 연계형 도달 — 승차장에서 거점까지만 태우고 거기서 갈아탄다.
+
+        문앞-목적지 = 집→승차장 보행 + 대기 + 승차장→거점 차내
+                      + 하차 채비 + 거점→목적지
+
+    목적지는 하나다(일산백병원). 직결형의 "의료기관 N곳"과는 다른 물음이므로
+    화면에서 섞지 않는다.
+    """
+    cs = np.asarray(tab["cell_stop"])
+    walk = np.asarray(tab["cell_walk"], float)
+    pop = np.asarray(tab["cell_pop"], float)
+    now = np.asarray(tab["cell_now"], float)
+    H = np.asarray(tab["hub_min"], float)[cs]              # (수요 × 거점)
+    on = np.asarray(tab["hub_onward"], float)[None, :]
+    tot = walk[:, None] + wait + H + HUB_ALIGHT_MIN + on
+    best = tot.min(1)
+    who = tot.argmin(1)
+    ok = best <= budget
+    P = pop.sum()
+    return {"per_cell": ok.astype(int), "per_cell_now": now,
+            "pop": P,
+            "now_pop": float(pop[now > 0].sum()),
+            "now_share": float(pop[now > 0].sum() / P),
+            "drt_pop": float(pop[ok].sum()),
+            "drt_share": float(pop[ok].sum() / P),
+            "new_pop": float(pop[ok].sum()),
+            "new_share": float(pop[ok].sum() / P),
+            "gain_pop": float(pop[ok].sum()),
+            "still_pop": float(pop[~ok].sum()),
+            "best_min": float(np.average(best, weights=pop)),
+            "walk_min": float(np.average(walk, weights=pop)),
+            "hub_share": {n: float(pop[ok & (who == i)].sum() / P)
+                          for i, n in enumerate(tab["hub_names"])},
+            "new_A": 0.0, "now_A": float((now * pop).sum() / P)}
 
 
 def reach(tab: dict, budget: float, wait: float) -> dict:

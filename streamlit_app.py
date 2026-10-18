@@ -77,7 +77,7 @@ def road() -> sim.Road:
 def routes(sel: str, k: int) -> list[dict]:
     """승차장은 scenarios.json 이 유일한 출처다. 화면에서 다시 풀지 않는다.
     다시 풀면 시드·알고리즘이 바뀔 때 표와 지도가 조용히 어긋난다."""
-    R = sim.stop_routes(road(), D["stops"][sel][str(k)], base(), 2)
+    R = sim.stop_routes(road(), D["stops"][str(k)], base(), 2)
     out = []
     for r in R:
         xy = np.asarray(r.pop("path"), float)
@@ -138,22 +138,32 @@ st.markdown(
     "</span></div>", unsafe_allow_html=True)
 
 c0 = st.columns([1.5, 4.5])
-SEL = c0[0].radio("승차장 선정", ["mclp", "kmeans"], horizontal=True,
-                  format_func=lambda s: {"mclp": "MCLP",
-                                         "kmeans": "k-평균"}[s],
-                  help="MCLP = 기준 거리 안 고령인구를 최대화하는 입지 모형"
-                       "(Church & ReVelle 1974). k-평균은 예전 방식으로 "
-                       "비교 기준선이다. 둘 다 같은 보행망 자로 잰다.")
+SEL = c0[0].radio("운영 방식", ["hub", "direct"], horizontal=True,
+                  format_func=lambda s: {"hub": "거점 연계",
+                                         "direct": "의원 직결"}[s],
+                  help="거점 연계 = 승차장에서 대화역·일산서구청까지만 태우고 "
+                       "거기서 기존 대중교통으로 갈아탄다(고봉동 똑버스 방식). "
+                       "의원 직결 = 집 앞 승차장에서 의원까지 바로 간다.")
+HUBT = D["meta"].get("hub_target", "일산백병원")
+HUB_TXT = " · ".join(f"{n} {h['onward_min']:.1f}분"
+                     for n, h in D.get("hubs", {}).items())
 c0[1].caption(
-    f"**{'MCLP — 기준 거리 안 고령인구 최대화' if SEL == 'mclp' else 'k-평균 — 비교 기준선'}**"
-    f" · 기준 거리 {D['meta'].get('S_m', 600):,.0f} m"
-    f" · 후보 실재 정류장 + 도로망 노드"
-    f" · 보행 {D['meta'].get('보행', 'OSM 보행망')}")
+    (f"**거점 연계** — 승차장 → "
+     + " · ".join(f"{n}({h['onward_min']:.1f}분)"
+                  for n, h in D.get("hubs", {}).items())
+     + f" → **{HUBT}**. 구간이 짧아 차량이 적게 든다."
+     if SEL == "hub" else
+     "**의원 직결** — 집 앞 승차장에서 의원까지 바로. 구간이 길어 차량이 많이 든다.")
+    + f" · 승차장 = **기존 정류장 {D['meta'].get('기존정류장', 0)}곳**"
+      f" + 신설 (MCLP, 기준 {D['meta'].get('S_m', 600):,.0f} m)")
 c = st.columns([1.9, 1.3, 1.3, 1.3, 1.5])
 vi = c[0].selectbox("차종", range(len(VEH)),
                     format_func=lambda i: VEH[i]["name"], index=1)
-fleet = c[1].slider("도입 대수", 1, 12, 10)
-K = c[2].slider("지정 승차장 수", 4, 16, 10)
+fleet = c[1].slider("도입 대수", 1, 12, 3 if SEL == "hub" else 10)
+K = c[2].slider("신설 승차장 수", int(min(D["meta"]["k"])),
+                int(max(D["meta"]["k"])), 4,
+                help="기존 버스정류장은 똑버스가 그냥 쓴다. 여기서 정하는 "
+                     "것은 그 위에 새로 만들 승차장 수다.")
 BUD = c[3].select_slider("시간 예산", [30, 45, 60], value=30,
                          format_func=lambda v: f"{v}분")
 bl = c[4].selectbox("현행(탄소 비교 기준)", list(BASELINE), index=0,
@@ -162,9 +172,10 @@ bl = c[4].selectbox("현행(탄소 비교 기준)", list(BASELINE), index=0,
 BL_NOTE, BL_EF, BL_OCC = BASELINE[bl]
 
 ROWS = ROWS[ROWS.sel == SEL]
+REACH = sim.reach_hub if SEL == "hub" else sim.reach
 cur = ROWS[(ROWS.vi == vi) & (ROWS.fleet == fleet) & (ROWS.k == K)].iloc[0]
-TAB = D["reach"][SEL][str(K)]
-R0 = sim.reach(TAB, BUD, float(cur.wait))
+TAB = D["reach"][str(K)]
+R0 = REACH(TAB, BUD, float(cur.wait))
 
 
 def carbon_of(df: pd.DataFrame) -> pd.Series:
@@ -174,13 +185,23 @@ def carbon_of(df: pd.DataFrame) -> pd.Series:
 def reach_of(k: int, fleet_: int, budget: int) -> dict:
     w = float(ROWS[(ROWS.k == k) & (ROWS.fleet == fleet_)
                    & (ROWS.vi == 0)].iloc[0].wait)
-    return sim.reach(D["reach"][SEL][str(k)], budget, w)
+    return REACH(D["reach"][str(k)], budget, w)
 
 
 # ── 핵심 수치 ─────────────────────────────────────────────────────────
 # 이 화면이 묻는 것은 하나다. 그것만 크게 띄우고 나머지는 작게 받친다.
-delta = 100 * (R0["new_share"] - R0["now_share"])
-now_p, new_p = 100 * R0["now_share"], 100 * R0["new_share"]
+HEAD = (f"{BUD}분 안에 {HUBT}에 닿는 고령인구" if SEL == "hub"
+        else f"{BUD}분 안에 병원에 닿는 고령인구")
+# 거점 연계는 "백병원에 닿는가"를 묻는다. 그 현행값은 우리 자료에 없어
+# 협업자 분석(C002, 30분 백병원 도달 1.4%)을 기준선으로 빌려 쓴다.
+# 지역 범위가 달라 정확히 같은 모집단은 아니다 — 화면에 그렇게 적는다.
+HUB_BASE = 0.014
+NOW_SHARE = HUB_BASE if SEL == "hub" else R0["now_share"]
+NOW_POP = NOW_SHARE * M["고령"] if SEL == "hub" else R0["now_pop"]
+NOW_LAB = ("현행 — 협업자 분석 1.4%" if SEL == "hub" else "원래 닿던 사람")
+now_p, new_p = 100 * NOW_SHARE, 100 * R0["new_share"]
+delta = new_p - now_p
+BASE_TXT = f"{now_p:.1f}%"
 w_now = now_p
 w_gain = max(0.0, new_p - now_p)
 w_no = max(0.0, 100 - new_p)
@@ -189,12 +210,12 @@ st.markdown(f"""
      #2a8d93 100%);border-radius:14px;padding:22px clamp(18px,3vw,34px) 20px;
      color:#fff;margin:4px 0 14px">
   <div style="font-size:.9rem;letter-spacing:.02em;opacity:.84;
-       font-weight:500">{BUD}분 안에 병원에 닿는 고령인구</div>
+       font-weight:500">{HEAD}</div>
   <div style="display:flex;align-items:baseline;gap:clamp(10px,2.2vw,26px);
        flex-wrap:wrap;margin-top:6px">
     <div style="font-family:'IBM Plex Mono',ui-monospace,monospace;
          font-size:clamp(1.5rem,3.4vw,2.4rem);font-weight:600;opacity:.62;
-         line-height:1">{now_p:.1f}%</div>
+         line-height:1">{BASE_TXT}</div>
     <div style="font-size:clamp(1.1rem,2.4vw,1.7rem);opacity:.6;
          line-height:1">→</div>
     <div style="font-family:'IBM Plex Mono',ui-monospace,monospace;
@@ -214,14 +235,12 @@ st.markdown(f"""
   </div>
   <div style="display:flex;gap:18px 26px;flex-wrap:wrap;margin-top:11px;
        font-size:.86rem">
-    <span><b style="font-size:1.12rem">{R0['now_pop']:,.0f}명</b>
-      <span style="opacity:.8">원래 닿던 사람</span></span>
+    <span><b style="font-size:1.12rem">{NOW_POP:,.0f}명</b>
+      <span style="opacity:.8">{NOW_LAB}</span></span>
     <span style="color:#ffd08a"><b style="font-size:1.12rem">
-      +{R0['gain_pop']:,.0f}명</b> 새로 닿게 됨</span>
+      +{max(0.0, R0['new_pop'] - NOW_POP):,.0f}명</b> 새로 닿게 됨</span>
     <span style="opacity:.78"><b style="font-size:1.12rem">
-      {R0['still_pop']:,.0f}명</b> 그래도 못 닿음
-      <span style="opacity:.8">(현행 {M['고령'] - R0['now_pop']:,.0f}명)</span>
-    </span>
+      {R0['still_pop']:,.0f}명</b> 그래도 못 닿음</span>
     <span style="opacity:.62;margin-left:auto">대상 고령 {M['고령']:,.0f}명 ·
       {VEH[vi]['name']} {fleet}대 · 승차장 {K}곳</span>
   </div>
@@ -272,7 +291,7 @@ GKEY = {(g[0], g[1]): i for i, g in enumerate(GRID)}
 def grid_cells(k_: int, sel: str = "") -> list[int]:
     """출발점마다 속한 500m 격자 번호. 격자망이 500m 로 떨어져 있다."""
     out = []
-    for x, y in D["reach"][SEL][str(k_)]["cell_xy"]:
+    for x, y in D["reach"][str(k_)]["cell_xy"]:
         gx = GX0 + ((x - GX0) // 500) * 500
         gy = GY0 + ((y - GY0) // 500) * 500
         out.append(GKEY.get((gx, gy), -1))
@@ -301,7 +320,7 @@ def grid_status() -> pd.DataFrame:
 GS = grid_status()
 COLORS = {"원래 닿던 곳": C4, "새로 닿게 됨": GOOD, "일부만": "#8aa8b0",
           "그래도 못 닿음": BAD}
-STOPS = D["stops"][SEL][str(K)]
+STOPS = D["stops"][str(K)]
 RT = routes(SEL, K)
 
 
@@ -367,7 +386,7 @@ st.caption(
 # ── 그래프 ────────────────────────────────────────────────────────────
 st.markdown("### 자세히 보기")
 PICK = st.radio("그래프", [
-    "대수별 도달", "승차장 수별 도달과 보행", "문앞-의원 시간 구성",
+    "대수별 도달", "신설 승차장 수별 도달과 보행", "문앞-의원 시간 구성",
     "승차장별 고령인구", "격자별 도달 변화", "차종별 연간 탄소",
     "도달과 예산"], horizontal=True, label_visibility="collapsed")
 
@@ -414,7 +433,7 @@ def c_fleet():
 
 def c_stops():
     d = pd.DataFrame([{
-        "승차장 수": kk, "도달 (%)": 100 * reach_of(kk, fleet, BUD)["new_share"],
+        "신설 승차장": kk, "도달 (%)": 100 * reach_of(kk, fleet, BUD)["new_share"],
         "커버 (%)": 100 * float(ROWS[(ROWS.k == kk) & (ROWS.fleet == fleet)
                                    & (ROWS.vi == 0)].iloc[0].cover_share),
         "보행 중앙 (m)": int(ROWS[(ROWS.k == kk) & (ROWS.fleet == fleet)
@@ -423,21 +442,22 @@ def c_stops():
     ax = alt.Axis(labelFontSize=13, titleFontSize=13)
     la = alt.Chart(d).mark_line(color=C1, point={"size": 90},
                                 strokeWidth=3).encode(
-        x=alt.X("승차장 수:Q", axis=alt.Axis(tickMinStep=2, labelFontSize=13,
+        x=alt.X("신설 승차장:Q", title="신설 승차장 수 (기존 정류장은 늘 쓴다)",
+                axis=alt.Axis(tickMinStep=2, labelFontSize=13,
                                          titleFontSize=13)),
         y=alt.Y("도달 (%):Q", title=f"{BUD}분 도달 (%)",
                 axis=alt.Axis(titleColor=C1, labelFontSize=13,
                               titleFontSize=13)),
-        tooltip=["승차장 수", "도달 (%)", "보행 중앙 (m)"])
+        tooltip=["신설 승차장", "도달 (%)", "커버 (%)", "보행 중앙 (m)"])
     lb = alt.Chart(d).mark_line(color=C2, point={"size": 80}, strokeWidth=2.6,
                                 strokeDash=[6, 4]).encode(
-        x="승차장 수:Q",
+        x="신설 승차장:Q",
         y=alt.Y("보행 중앙 (m):Q", axis=alt.Axis(titleColor=C2,
                                              labelFontSize=13,
                                              titleFontSize=13)))
     lc = alt.Chart(d).mark_line(color=C3, point={"size": 70},
                                 strokeWidth=2.2, opacity=.85).encode(
-        x="승차장 수:Q", y=alt.Y("커버 (%):Q"))
+        x="신설 승차장:Q", y=alt.Y("커버 (%):Q"))
     pk = alt.Chart(pd.DataFrame({"x": [K]})).mark_rule(
         color="#555", strokeDash=[3, 3], strokeWidth=1.6).encode(x="x:Q")
     return alt.layer(la, lc, lb, pk).resolve_scale(y="independent"), (
@@ -473,7 +493,7 @@ def c_split():
         f"보행 {walk:.1f}분 + 대기 {wait:.0f}분을 빼고 나면 차에 탈 수 있는"
         f" 시간은 **{ride:.1f}분**이다. 30 km/h 로 {ride / 2:.1f} km 안의"
         f" 의원만 닿는다. 셋 가운데 **대기가 가장 크게 움직이고, 대수로"
-        f" 줄일 수 있다.** 보행은 승차장 수로 줄인다.")
+        f" 줄일 수 있다.** 보행은 신설 승차장으로 줄인다.")
 
 
 def c_stoppop():
@@ -481,7 +501,8 @@ def c_stoppop():
         "승차장": s["name"].split()[-1], "고령인구": s["pop"],
         "보행 중앙 (m)": s["walk_med"], "보행 최대 (m)": s["walk_max"],
         "맡은 격자": s["cells"],
-        "구분": "기존 정류장" if s.get("exist") else "신설"} for s in STOPS])
+        "구분": "기존 정류장" if s.get("exist") else "신설"}
+        for s in STOPS if s.get("is_new") or s.get("pop", 0) > 0])
     bar = alt.Chart(d).mark_bar(cornerRadius=3).encode(
         color=alt.Color("구분:N", scale=alt.Scale(
             domain=["기존 정류장", "신설"], range=[C3, C1]),
@@ -595,7 +616,7 @@ def c_cost():
         f" 직선으로 는다 — 그 꺾이는 자리가 결정의 자리다.")
 
 
-CHARTS = {"대수별 도달": c_fleet, "승차장 수별 도달과 보행": c_stops,
+CHARTS = {"대수별 도달": c_fleet, "신설 승차장 수별 도달과 보행": c_stops,
           "문앞-의원 시간 구성": c_split, "승차장별 고령인구": c_stoppop,
           "격자별 도달 변화": c_grid, "차종별 연간 탄소": c_carbon,
           "도달과 예산": c_cost}
@@ -653,7 +674,33 @@ with st.expander("방법과 한계", expanded=False):
 국가계수에 소형승합이 없어 쏠라티 디젤은 승용 대형 경유~화물 소형 경유로
 범위를 잡았다.
 
-**승차장을 어떻게 골랐나** — MCLP(최대 커버 입지, Church & ReVelle 1974).
+**운영 방식** — 똑버스는 보통 **거점까지만** 태우고 거기서 기존 대중교통으로
+갈아탄다(고봉동 3대, 식사·향동 각 4대가 그렇다). 구간이 짧아 차량이 적게 든다.
+이 화면은 그 **거점 연계**와, 집 앞에서 의원까지 바로 가는 **의원 직결**을
+나란히 둔다. 거점에서 {HUBT}까지 걸리는 시간
+({HUB_TXT})은
+협업자 분석(ParkJH0313/goyang-senior-mobility)에서 가져왔다. 대화역은
+{HUBT}이 380 m 거리라 도보다.
+
+두 방식은 **다른 것을 묻는다.** 거점 연계는 "{HUBT}에 닿는가", 의원 직결은
+"의료기관에 한 곳이라도 닿는가"다. 한 숫자로 견주지 않는다.
+
+**056번 마을버스는 현행에 이미 들어 있다.** 분석에 쓴 대중교통 번들에
+노선번호 056(`BR_3100_241299005`)이 있고, 가좌·송포 2 km 안 정류장을 지나는
+노선 153개 중 하나다.
+
+**승차장을 어떻게 골랐나** — 기존 버스정류장은 똑버스가 **그냥 쓴다**. 노선이
+없는 수요응답형이라 폴이 이미 서 있으면 추가 비용이 들지 않는다. 군집 400 m 안
+실재 정류장 {D['meta'].get('기존정류장', 0)}곳이 그것이고, 이것만으로 도보
+12.5분 커버가 44.8%다. 그 위에 **신설 몇 곳을 더할지**를 MCLP(최대 커버 입지,
+Church & ReVelle 1974)로 고른다.
+
+**신설 자리는 차를 세울 수 있는 곳이어야 한다.** 고속국도·도시고속도로와
+설계속도 60 km/h 초과 구간은 후보에서 뺀다. 편도 1차로는 빼지 않고 **「정차
+여건 확인 필요」로 표시**한다 — 마을버스는 그런 길에도 잠깐 서지만, 실제
+설치에는 현장 확인이 따로 필요하다.
+
+(아래는 MCLP 정식이다.)
 승차장 k곳으로 **기준 거리 {SM:,.0f} m(0.8 m/s 로 {SM / 48:.1f}분) 안에 든
 고령인구를 최대화**한다.
 
@@ -662,8 +709,7 @@ max Σ aᵢyᵢ   s.t.  Σ_{{j∈Nᵢ}} xⱼ ≥ yᵢ ,  Σxⱼ = k ,  x,y ∈ {
 aᵢ = 수요점 i 고령인구,  Nᵢ = {{ j : 보행거리(i,j) ≤ S }}
 ```
 
-후보지는 **실재 버스정류장 417곳 + 도로망 노드를 100 m 격자로 솎은 것**이다.
-평면 아무 데나가 아니라 **실제로 세울 수 있는 자리**에서만 고른다. 보행거리는
+후보지는 실재 버스정류장과 도로망 노드를 100 m 격자로 솎은 것이다. 보행거리는
 OSM 보행망 최단경로이고, 이 지역에서 **직선의 1.34배**(상위 10%는 1.80배)다 —
 논·하천·자유로가 가로막기 때문이다. 같은 값을 내는 해가 여럿일 때는 실재
 정류장과 짧은 보행을 선호하도록 아주 작은 가중치를 둬서 해를 결정한다. 그래서
@@ -672,8 +718,9 @@ OSM 보행망 최단경로이고, 이 지역에서 **직선의 1.34배**(상위 
 **커버 밖 사람도 걸어서 탄다.** MCLP 는 어디에 놓을지만 정하고, 30분 도달은
 커버 여부와 무관하게 실제 보행시간으로 따로 센다.
 
-**비교 기준선** — 위 「승차장 선정」에서 k-평균을 고르면 예전 방식이 나온다.
-두 방식 모두 같은 보행망 자로 재므로 공정하게 견줄 수 있다.
+**승차장 선정 방식 비교** — 예전에 쓰던 고령인구 가중 k-평균과 견주면,
+같은 보행망 자로 재어 신설 10곳 기준 커버 54.3% 대 68.5%, 보행 중앙 620 m 대
+543 m 로 MCLP 가 낫다.
 
 **그래도 임시 가정이다** — 실제 선정에는 정차 가능 지점, 보도·횡단 여건,
 소유관계 확인이 따로 필요하다. 설계속도가 높은 도로변 후보는 정차 가능성을

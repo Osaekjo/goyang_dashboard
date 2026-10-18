@@ -96,20 +96,31 @@ def walk_rows(wg: WalkGraph, src: np.ndarray, dst: np.ndarray,
 def build_candidates(P: np.ndarray, stops_parquet: Path) -> pd.DataFrame:
     g = np.load(DATA / "v6_graph.npz")
     rn = np.c_[g["nx"], g["ny"]].astype(float)
+    # 노드에 접한 링크에서 정차 가능성을 본다.
+    #   제한속도 — 간선 고속 구간에는 세울 수 없다
+    #   차로수   — 편도 1차로에 세우면 뒤차가 못 지나간다
+    #   도로등급 — 101 고속국도 · 102 도시고속도로는 제외
     spd = np.full(len(rn), np.inf)
-    # 노드에 접한 링크의 최저 제한속도 — 간선 노변 정차는 따로 확인해야 한다
+    lanes = np.zeros(len(rn))
+    rank_hi = np.full(len(rn), 999)
     v = g["elen"] / np.maximum(g["esec"], 1e-6) * 3.6
+    ln = g["elanes"] if "elanes" in g.files else np.full(len(v), 2.0)
+    rk = g["erank"] if "erank" in g.files else np.full(len(v), 107)
     for arr in (g["ef"], g["et"]):
         np.minimum.at(spd, arr, v)
+        np.maximum.at(lanes, arr, ln)
+        np.minimum.at(rank_hi, arr, rk)
 
     lo, hi = P.min(0) - PAD_M, P.max(0) + PAD_M
     m = ((rn[:, 0] >= lo[0]) & (rn[:, 0] <= hi[0]) &
          (rn[:, 1] >= lo[1]) & (rn[:, 1] <= hi[1]))
     rn, spd_r, nid = rn[m], spd[m], np.where(m)[0]
+    lanes_r, rank_r = lanes[m], rank_hi[m]
     keep = np.unique(np.floor(rn / THIN_M).astype(int), axis=0,
                      return_index=True)[1]
     road = pd.DataFrame({"x": rn[keep, 0], "y": rn[keep, 1],
                          "node": nid[keep], "spd_min": spd_r[keep],
+                         "lanes": lanes_r[keep], "rank": rank_r[keep],
                          "exist": False, "stop_id": "", "stop_name": "",
                          "src": "road"})
 
@@ -124,6 +135,7 @@ def build_candidates(P: np.ndarray, stops_parquet: Path) -> pd.DataFrame:
                          "spd_min": spd[sn], "exist": True,
                          "stop_id": st.stop_id.astype(str).values,
                          "stop_name": st.stop_name.astype(str).values,
+                         "lanes": lanes[sn], "rank": rank_hi[sn],
                          "src": "pole"})
 
     # 비교 기준선인 가중 k-평균 승차장도 후보로 넣는다. 안 넣으면 그쪽만
@@ -138,6 +150,8 @@ def build_candidates(P: np.ndarray, stops_parquet: Path) -> pd.DataFrame:
     km = pd.DataFrame(km, columns=["x", "y", "node"]).drop_duplicates(
         subset=["x", "y"])
     km["spd_min"] = spd[km.node.values]
+    km["lanes"] = lanes[km.node.values]
+    km["rank"] = rank_hi[km.node.values]
     km["exist"] = False
     km["stop_id"] = ""
     km["stop_name"] = ""
@@ -149,6 +163,25 @@ def build_candidates(P: np.ndarray, stops_parquet: Path) -> pd.DataFrame:
     c = pd.concat([pole, km, road], ignore_index=True)
     c = c.drop_duplicates(subset=["x", "y"]).reset_index(drop=True)
     c["cid"] = np.arange(len(c))
+    # 신설 후보는 정차할 수 있는 자리여야 한다. 실재 정류장 폴은 이미
+    # 정차지이므로 무조건 통과시킨다.
+    # 아예 불가능한 것만 뺀다 — 고속국도·도시고속도로, 설계속도 60 초과.
+    # 편도 1차로는 배제하지 않고 '정차 여건 확인 필요'로 표시한다. 마을버스는
+    # 그런 길에도 잠깐 선다. 하드 배제하면 커버 천장이 80%에서 56%로 떨어져
+    # 이 지역에서 할 수 있는 일을 과소평가하게 된다.
+    c["stoppable"] = c.exist | (
+        (c.spd_min <= 60) & (~c["rank"].isin([101, 102])))
+    c["needs_check"] = (~c.exist) & (c.lanes < 2)
+    # 군집 격자에서 400 m 안이면 '현장 정류장' — 똑버스가 바로 쓸 수 있다
+    meta2 = json.loads((DATA / "data.json").read_text(encoding="utf-8"))
+    G = [(g[0], g[1]) for g in meta2["grid"] if g[8]]
+    def near(x, y, b=400.0):
+        return any(gx - b <= x <= gx + 500 + b and gy - b <= y <= gy + 500 + b
+                   for gx, gy in G)
+    c["in_area"] = [near(x, y) for x, y in zip(c.x, c.y)]
+    print(f"  정차 가능 {int(c.stoppable.sum()):,}/{len(c):,} "
+          f"(그중 여건 확인 필요 {int(c.needs_check.sum()):,}) · "
+          f"군집 400m 내 실재 정류장 {int((c.exist & c.in_area).sum())}곳")
     return c
 
 
@@ -222,6 +255,10 @@ def main(write: bool, walk_graph: Path, stops_parquet: Path) -> None:
             cand_node=cand.node.values.astype(np.int32),
             cand_spd=cand.spd_min.values.astype(np.float32),
             cand_exist=cand.exist.values.astype(bool),
+            cand_stoppable=cand.stoppable.values.astype(bool),
+            cand_needs_check=cand.needs_check.values.astype(bool),
+            cand_in_area=cand.in_area.values.astype(bool),
+            cand_lanes=cand.lanes.values.astype(np.float32),
             cand_stop_id=cand.stop_id.values.astype("U24"),
             cand_stop_name=cand.stop_name.values.astype("U40"),
             o_snap=od.astype(np.float32),

@@ -38,10 +38,11 @@ HERE = Path(__file__).resolve().parent
 OUT = HERE / "data" / "scenarios.json"
 TO_WGS = Transformer.from_crs(5179, 4326, always_xy=True)
 
-K_RANGE = range(4, 17)
+K_RANGE = range(0, 13)   # 신설 승차장 수 (기존 정류장은 늘 쓴다)
 FLEET_RANGE = range(1, 13)
 NEAR_CLINICS = 25
 SENS_S = (400.0, 500.0, 600.0, 800.0)
+MODES = ("hub", "direct")
 
 
 def lonlat(x, y) -> tuple[float, float]:
@@ -109,12 +110,13 @@ def serialize(stops: list[dict]) -> list[dict]:
     """화면이 다시 풀지 않아도 되게 x·y·node 까지 전부 내보낸다."""
     return [{k: s[k] for k in (
         "i", "cid", "x", "y", "node", "lon", "lat", "pop", "pop_cov",
-        "cells", "walk_med", "walk_max", "exist", "stop_name", "spd_min",
+        "cells", "walk_med", "walk_max", "exist", "is_new", "needs_check",
+        "stoppable", "lanes", "stop_name", "spd_min",
         "name") if k in s} for s in stops]
 
 
 def main(use_kakao: bool, write: bool, S_m: float,
-         methods: tuple[str, ...]) -> None:
+         modes: tuple[str, ...] = MODES) -> None:
     t0 = time.perf_counter()
     road, meta = sim.Road(), sim.load_meta()
     C = mclp.load_cands(meta)
@@ -124,71 +126,44 @@ def main(use_kakao: bool, write: bool, S_m: float,
         kk = kakao.Kakao()
         print(f"[카카오] 키 {'있음' if kk.ok else '없음 → 도로망으로 진행'}")
 
-    # ── 패스 1 — 카카오 없이 풀어 쓰이는 후보의 합집합을 얻는다 ───────
-    # 두 선정법이 쓰는 후보를 **모두** 모아 한 번에 받는다. 한쪽만 카카오
-    # 거리를 쓰면 비교가 또 어긋난다.
-    ladder, T_cid, km_cids = {}, {}, {}
-    U: set[int] = set()
-    if "mclp" in methods:
+    FIX = mclp.base_stops(C)
+    t = time.perf_counter()
+    ladder = mclp.solve_ladder(C, K_RANGE, S_m, fixed=FIX)
+    U = sorted(set(FIX) | {c for r in ladder.values() for c in r["cids"]})
+    print(f"[MCLP] S={S_m:.0f}m · 기존 정류장 {len(FIX)}곳 고정 + 신설 "
+          f"{K_RANGE.start}~{K_RANGE.stop - 1}곳 · "
+          f"{time.perf_counter() - t:.1f}초 · 쓰이는 후보 {len(U)}곳")
+    print(f"  커버 {100 * ladder[0]['cov_share']:.1f}%(기존만) → "
+          f"{100 * ladder[max(K_RANGE)]['cov_share']:.1f}%(신설 최대)")
+
+    T_cid = {}
+    if kk and kk.ok:
         t = time.perf_counter()
-        ladder = mclp.solve_ladder(C, K_RANGE, S_m)
-        U |= {c for r in ladder.values() for c in r["cids"]}
-        print(f"[MCLP] S={S_m:.0f}m · k={K_RANGE.start}~{K_RANGE.stop - 1} "
-              f"{time.perf_counter() - t:.1f}초 · 후보 합집합 {len(U)}곳 "
-              f"(실재 정류장 {int(C.exist[sorted(U)].sum())})")
-    if "kmeans" in methods:
-        for k in K_RANGE:
-            km_cids[k] = mclp.cids_of(C, sim.designated_stops(road, meta, k))
-            U |= set(km_cids[k])
-        print(f"[k-평균] 비교 기준선 후보 포함 → 합집합 {len(U)}곳")
-    if kk and kk.ok and U:
-        t = time.perf_counter()
-        T_cid, got = kakao_cids(road, meta, C, sorted(U), kk)
+        T_cid, got = kakao_cids(road, meta, C, U, kk)
         kk.flush()
         print(f"[카카오] 거리 {got:,}쌍 · {kk.report()} · "
               f"{time.perf_counter() - t:.0f}초")
 
     rows, stops_out, reach_out, cover = [], {}, {}, {}
-    for sel in methods:
-        stops_out[sel], reach_out[sel], cover[sel] = {}, {}, {}
-        for k in K_RANGE:
-            if sel == "mclp":
-                st = mclp.stops(C, ladder[k]["cids"], S_m)
-                wt = mclp.assign(C, sorted(ladder[k]["cids"]))
-                tab = rekey(T_cid, st) if T_cid else None
-                cov = ladder[k]["cov_share"]
-            else:
-                st = sim.designated_stops(road, meta, k)
-                for s in st:
-                    s.setdefault("cid", -1)
-                    s.setdefault("exist", False)
-                    s.setdefault("pop_cov", 0.0)
-                    s.setdefault("spd_min", 0.0)
-                    s.setdefault("stop_name", "")
-                    s["lon"], s["lat"] = lonlat(s["x"], s["y"])
-                # k-평균 승차장도 후보 풀에 넣어 뒀으므로 **같은 보행망 자로**
-                # 잰다. 직선으로 재면 옛 방식이 유리해져 비교가 깨진다.
-                kc = km_cids[k]
-                for s, c in zip(st, kc):
-                    s["cid"] = int(c)
-                wt = mclp.assign(C, kc)
-                tab = rekey(T_cid, st) if T_cid else None
-                cov = float(C.pop[(C.walk[:, kc] <= S_m).any(1)].sum()
-                            / C.pop.sum())
-            reach_out[sel][str(k)] = sim.reach_tables(
-                road, meta, st, tab, walk_tab=wt)
-            stops_out[sel][str(k)] = serialize(st)
-            cover[sel][str(k)] = round(cov, 4)
-
+    for k in K_RANGE:
+        st = mclp.stops(C, ladder[k]["cids"], S_m, fixed=FIX)
+        cids = sorted(set(ladder[k]["cids"]) | set(FIX))
+        wt = mclp.assign(C, cids)
+        tab = rekey(T_cid, st) if T_cid else None
+        reach_out[str(k)] = sim.reach_tables(road, meta, st, tab, walk_tab=wt)
+        stops_out[str(k)] = serialize(st)
+        cover[str(k)] = round(ladder[k]["cov_share"], 4)
+        for mode in modes:
             for vi, veh in enumerate(sim.VEHICLES):
                 for f in FLEET_RANGE:
                     S = sim.simulate(road, meta, veh, f, stops=st,
-                                     km_table=tab, walk_tab=wt)
+                                     km_table=tab, walk_tab=wt, mode=mode)
                     c = sim.carbon(S)
                     w = np.array([r.pick - r.call for r in S["rides"]])
                     rows.append({
-                        "sel": sel, "vi": vi, "fleet": f, "k": k,
-                        "cover_share": round(cov, 4),
+                        "sel": mode, "vi": vi, "fleet": f, "k": k,
+                        "stops_total": len(st),
+                        "cover_share": round(ladder[k]["cov_share"], 4),
                         "occ": round(S["occ"], 3),
                         "wait": round(S["wait"], 1),
                         "wait_p90": round(float(np.percentile(w, 90)), 1),
@@ -197,7 +172,6 @@ def main(use_kakao: bool, write: bool, S_m: float,
                         "km": round(S["km"], 1),
                         "dead_share": round(S["dead_share"], 4),
                         "walk_med": round(S["walk_med"]),
-                        "walk_mean": round(S["walk_mean"]),
                         "walk_p90": round(S["walk_p90"]),
                         "walk_max": round(S["walk_max"]),
                         "walk_min": round(S["walk_min_med"], 1),
@@ -214,18 +188,15 @@ def main(use_kakao: bool, write: bool, S_m: float,
                         "in_hours": bool(S["end"] <= sim.T1),
                         "kakao": round(S["kakao_share"], 3),
                     })
-        print(f"[{sel}] {len([r for r in rows if r['sel'] == sel]):,}행 "
+        print(f"  신설 {k:>2}곳 (정류장 {len(st)}) · 커버 "
+              f"{100 * ladder[k]['cov_share']:.1f}% · 누적 {len(rows):,}행 "
               f"({time.perf_counter() - t0:.0f}초)")
 
-    # ── 기준 거리 민감도 — 커버만, 시뮬레이션 없음 (2초) ──────────────
     sens = {}
-    if "mclp" in methods:
-        for s in SENS_S:
-            L = mclp.solve_ladder(C, K_RANGE, s)
-            sens[str(int(s))] = {str(k): round(L[k]["cov_share"], 4)
-                                 for k in K_RANGE}
-        print(f"[민감도] 기준 거리 {len(SENS_S)}종 × k {len(list(K_RANGE))}개")
-
+    for s in SENS_S:
+        L = mclp.solve_ladder(C, K_RANGE, s, fixed=FIX)
+        sens[str(int(s))] = {str(k): round(L[k]["cov_share"], 4)
+                             for k in K_RANGE}
     if kk:
         kk.flush()
     out = {
@@ -234,26 +205,33 @@ def main(use_kakao: bool, write: bool, S_m: float,
         "vehicles": [{"id": v["id"], "name": v["name"], "ef": round(v["ef"], 1),
                       "ef_hi": round(v["ef_hi"], 1) if v["ef_hi"] else None,
                       "cap": v["cap"]} for v in sim.VEHICLES],
+        "hubs": {n: {"onward_min": h["onward_min"], "note": h["note"]}
+                 for n, h in sim.HUBS.items()},
         "meta": {"생성": time.strftime("%Y-%m-%d"),
                  "거리출처": "카카오모빌리티" if (kk and kk.ok)
                           else "국가표준노드링크 2025-05-12",
-                 "S_m": S_m, "methods": list(methods),
-                 "보행": "OSM 보행망 최단경로 (MCLP) / 직선 (k-평균)",
+                 "S_m": S_m, "methods": list(modes),
+                 "기존정류장": len(FIX), "hub_target": sim.HUB_TARGET,
+                 "보행": "OSM 보행망 최단경로",
                  "후보지": C.meta, "k": list(K_RANGE),
                  "fleet": list(FLEET_RANGE)},
     }
-    print(f"\n[표] {len(rows):,}행 · 선정법 {len(methods)}종")
-    for sel in methods:
-        r = next(x for x in rows if x["sel"] == sel and x["k"] == 10
-                 and x["fleet"] == 10 and x["vi"] == 1)
-        rc = sim.reach(reach_out[sel]["10"], 30, r["wait"])
-        print(f"  {sel:<7} k=10·10대 · 커버 {100 * r['cover_share']:.1f}% · "
-              f"보행중앙 {r['walk_med']}m · 30분 도달 "
-              f"{100 * rc['now_share']:.1f}% → {100 * rc['new_share']:.1f}%")
+    print(f"\n[표] {len(rows):,}행 · 운영방식 {len(modes)}종")
+    for mode in modes:
+        for f in (3, 10):
+            r = next((x for x in rows if x["sel"] == mode and x["k"] == 4
+                      and x["fleet"] == f and x["vi"] == 1), None)
+            if not r:
+                continue
+            fn = sim.reach_hub if mode == "hub" else sim.reach
+            rc = fn(reach_out["4"], 30, r["wait"])
+            print(f"  {mode:<7} 신설4·{f:>2}대 · 재차 {r['occ']:.2f} · 대기 "
+                  f"{r['wait']:>5.0f}분 · 30분 도달 {100 * rc['drt_share']:.1f}%"
+                  f" · 연 탄소 {r['cut_year_t']:+.1f} t")
     if write:
         OUT.write_text(json.dumps(out, ensure_ascii=False,
                                   separators=(",", ":")), encoding="utf-8")
-        print(f"\n  저장 {OUT.relative_to(HERE)}  "
+        print(f"\n저장 {OUT.relative_to(HERE)}  "
               f"{OUT.stat().st_size / 1024:,.0f} KB")
     print(f"총 {time.perf_counter() - t0:.0f}초")
 
@@ -261,9 +239,9 @@ def main(use_kakao: bool, write: bool, S_m: float,
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--S", type=float, default=600.0)
-    ap.add_argument("--methods", default="mclp,kmeans")
+    ap.add_argument("--modes", default="hub,direct")
     ap.add_argument("--no-kakao", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args()
     main(not a.no_kakao, not a.dry_run, a.S,
-         tuple(m.strip() for m in a.methods.split(",") if m.strip()))
+         tuple(m.strip() for m in a.modes.split(",") if m.strip()))
